@@ -43,9 +43,6 @@ function isBadSeqError(err: StellarError): boolean {
   }
 
   return false;
-  // Fallback string matching, for a StellarError that didn't go through
-  // toStellarClientError (e.g. constructed directly elsewhere).
-  return err.message.includes("bad_seq") || err.message.includes("tx_bad_seq");
 }
 
 /**
