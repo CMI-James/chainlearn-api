@@ -283,7 +283,7 @@ export class AuthService {
       logger.info({ stellarAddress, userId: user.id }, "New user created");
     }
 
-    auditLog("auth.login", { userId: user.id, stellarAddress });
+    await auditLog("auth.login", { userId: user.id, stellarAddress });
 
     return {
       token: "", // Will be set by controller

@@ -6,6 +6,7 @@ import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { db } from "../../config/database.js";
 import {
   users,
+  sessions,
   enrollments,
   quizSubmissions,
   credentials,
@@ -17,6 +18,7 @@ import { config } from "../../config/index.js";
 import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 import { auditLog } from "../../audit/index.js";
+import { revokeToken } from "../../middleware/auth.js";
 import {
   cacheGet,
   cacheSet,
@@ -44,6 +46,8 @@ import type {
   UserCourseProgress,
   UserCourseQuizScore,
 } from "./user.types.js";
+
+const JWT_TTL_SECONDS = 24 * 60 * 60;
 
 export class UserService {
   async getProfile(userId: string): Promise<UserProfile> {
@@ -778,6 +782,18 @@ export class UserService {
   }
 
   async deleteAccount(userId: string): Promise<void> {
+    const userSessions = await db
+      .select()
+      .from(sessions)
+      .where(and(eq(sessions.userId, userId), isNull(sessions.revokedAt)));
+
+    for (const session of userSessions) {
+      await db
+        .update(sessions)
+        .set({ revokedAt: new Date() })
+        .where(eq(sessions.id, session.id));
+      await revokeToken(session.tokenId, JWT_TTL_SECONDS);
+    }
     const [deleted] = await db
       .update(users)
       .set({

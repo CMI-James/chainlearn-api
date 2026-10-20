@@ -266,8 +266,8 @@ async function buildApp() {
       (c) => c.status === "fulfilled",
     );
 
-    return reply.status(ready ? 200 : 503).send({
-      status: ready ? "ready" : "not_ready",
+    return reply.status(allHealthy ? 200 : 503).send({
+      status: allHealthy ? "ready" : "not_ready",
       checks: {
         database: dbCheck.status === "fulfilled" ? "ok" : "error",
         redis: redisCheck.status === "fulfilled" ? "ok" : "error",
@@ -390,11 +390,6 @@ async function buildApp() {
     });
   });
 
-  app.get("/metrics", { preHandler: authGuard }, async (_request, reply) => {
-    reply.header("Content-Type", registry.contentType);
-    return reply.send(await registry.metrics());
-  });
-
   // ─── Admin: Auth IP Blocks ─────────────────────────────────────────────
   app.get("/admin/auth-blocks", async (_request, reply) => {
     const blocks = await listBlockedIps();
@@ -465,7 +460,6 @@ async function start() {
       clearInterval(cacheWarmInterval);
     }
     await app.close();
-    await stopAuditLogger();
     await closeDatabase();
     await closeRedis();
     await shutdownTracing();

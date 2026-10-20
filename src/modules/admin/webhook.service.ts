@@ -34,7 +34,7 @@ export class WebhookService {
       })
       .returning();
 
-    auditLog("webhook.created", {
+    await auditLog("webhook.created", {
       webhookId: webhook.id,
       url: webhook.url,
       events: webhook.events as unknown as string[],
@@ -75,7 +75,7 @@ export class WebhookService {
       .where(eq(webhooks.id, webhookId))
       .returning();
 
-    auditLog("webhook.updated", {
+    await auditLog("webhook.updated", {
       webhookId: updated.id,
       changes: Object.keys(body),
     });
@@ -103,7 +103,7 @@ export class WebhookService {
 
     await db.delete(webhooks).where(eq(webhooks.id, webhookId));
 
-    auditLog("webhook.deleted", {
+    await auditLog("webhook.deleted", {
       webhookId,
       url: existing.url,
     });
@@ -235,7 +235,7 @@ export class WebhookService {
       .set({ secret: newSecret, updatedAt: new Date() })
       .where(eq(webhooks.id, webhookId));
 
-    auditLog("webhook.secret_rotated", {
+    await auditLog("webhook.secret_rotated", {
       webhookId,
     });
 

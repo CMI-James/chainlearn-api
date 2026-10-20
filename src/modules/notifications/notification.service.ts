@@ -89,6 +89,16 @@ export class NotificationService {
     return this.toItem(updated);
   }
 
+  async markAllRead(userId: string): Promise<{ count: number }> {
+    const result = await db
+      .update(notifications)
+      .set({ read: true })
+      .where(and(eq(notifications.userId, userId), eq(notifications.read, false)))
+      .returning({ id: notifications.id });
+
+    return { count: result.length };
+  }
+
   /** Create a notification for a user (e.g. when an achievement or badge is unlocked). */
   async create(data: {
     userId: string;

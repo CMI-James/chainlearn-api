@@ -43,7 +43,7 @@ import {
   cacheKey,
   cacheInvalidatePattern,
 } from "../../cache/index.js";
-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { NotFoundError, ValidationError } from "../../utils/errors.js";
 import { DeductCreditsDto } from './dto/deduct-credits.dto';
 
 const REWARD_AMOUNT = 10; // credits per passed quiz
@@ -747,14 +747,14 @@ export class RewardService {
       });
 
       if (!user) {
-        throw new NotFoundException(`User with ID ${userId} not found`);
+        throw new NotFoundError(`User with ID ${userId} not found`);
       }
 
       // 2. Validate that amount does not exceed user's balance
       if (user.credits < dto.amount) {
-        throw new BadRequestException(
-          `Insufficient credits. User balance (${user.credits}) is less than requested deduction amount (${dto.amount}).`,
-        );
+        throw new ValidationError({
+          amount: [`Insufficient credits. User balance (${user.credits}) is less than requested deduction amount (${dto.amount}).`],
+        });
       }
     });
   }

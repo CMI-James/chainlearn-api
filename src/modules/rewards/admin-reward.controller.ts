@@ -1,28 +1,21 @@
-// src/modules/rewards/admin-reward.controller.ts (Controller endpoint)
-import { Controller, Post, Body, Param, UseGuards, Req } from '@nestjs/common';
-import { RewardService } from './reward.service';
-import { DeductCreditsDto } from './dto/deduct-credits.dto';
-// import { AdminGuard } from '../auth/guards/admin.guard';
-// import { CurrentUser } from '../auth/decorators/current-user.decorator';
+// src/modules/rewards/admin-reward.controller.ts
+import { FastifyRequest, FastifyReply } from 'fastify';
+import { RewardService } from './reward.service.js';
+import { DeductCreditsDto } from './dto/deduct-credits.dto.js';
 
-@Controller('api/v1/admin/users')
-export class AdminRewardController {
-  constructor(private readonly rewardService: RewardService) {}
+const rewardService = new RewardService();
 
-  @Post(':id/credits/deduct')
-  // @UseGuards(AdminGuard)
-  async deductCredits(
-    @Param('id') userId: string,
-    @Body() dto: DeductCreditsDto,
-    @Req() req: any,
-  ) {
-    const adminId = req.user?.id || 'mock-admin-id';
-    const result = await this.rewardService.deductCredits(adminId, userId, dto);
+export async function deductCreditsHandler(
+  req: FastifyRequest<{ Params: { id: string }; Body: DeductCreditsDto }>,
+  reply: FastifyReply,
+) {
+  const userId = req.params.id;
+  const adminId = (req as any).user?.id ?? 'mock-admin-id';
+  const result = await rewardService.deductCredits(adminId, userId, req.body);
 
-    return {
-      success: true,
-      message: 'Credits successfully deducted',
-      data: result,
-    };
-  }
+  return reply.send({
+    success: true,
+    message: 'Credits successfully deducted',
+    data: result,
+  });
 }

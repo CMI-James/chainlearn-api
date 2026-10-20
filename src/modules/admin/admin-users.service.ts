@@ -33,7 +33,10 @@ export class AdminUsersService {
   async listUsers(
     query: ListUsersQuery,
   ): Promise<{ users: AdminUserSummary[]; total: number }> {
-    const search = query.search?.trim() || undefined;
+    const rawSearch = query.search?.trim() || undefined;
+    // Escape LIKE metacharacters so a search for "100%" or "foo_bar" matches
+    // literally rather than being treated as a wildcard pattern. (#565)
+    const search = rawSearch?.replace(/[\\%_]/g, "\\$&");
     const conditions = search
       ? [
           or(
@@ -245,7 +248,6 @@ export class AdminUsersService {
         and(
           eq(users.id, userId),
           isNull(users.deletedAt),
-          sql`${users.credits} >= ${amount}`,
           gte(users.credits, amount),
         ),
       )
