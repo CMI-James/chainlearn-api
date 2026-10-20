@@ -1,7 +1,6 @@
 import type { FastifyInstance, FastifySchema } from "fastify";
 import { authController } from "./auth.controller.js";
 import { validate } from "../../middleware/validation.js";
-import { challengeSchema, verifySchema } from "./auth.types.js";
 import { checkIpBlock } from "../../middleware/auth-brute-force.js";
 import { authGuard } from "../../middleware/auth.js";
 import { authRateLimit } from "../../middleware/rate-limit.js";
