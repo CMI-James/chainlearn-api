@@ -86,6 +86,7 @@ export async function authGuard(
     (request as AuthenticatedRequest).authUser = {
       id: user.id,
       stellarAddress: user.stellarAddress,
+      isAdmin: user.isAdmin ?? false,
     };
   } catch (err) {
     if (err instanceof UnauthorizedError) throw err;
@@ -110,9 +111,8 @@ export async function optionalAuth(
 
 /**
  * Restricts a route to admin users. Must run after authGuard — it reads
- * `request.authUser` set by it and re-fetches the user's isAdmin flag
- * (not carried on the JWT/AuthUser, so it always reflects the current
- * database state rather than a stale claim from token-issue time).
+ * `request.authUser.isAdmin` which authGuard already fetched from the DB,
+ * so no second round-trip is needed (#537).
  */
 export async function adminGuard(
   request: FastifyRequest,
@@ -120,11 +120,7 @@ export async function adminGuard(
 ): Promise<void> {
   const { authUser } = request as AuthenticatedRequest;
 
-  const user = await db.query.users.findFirst({
-    where: eq(users.id, authUser.id),
-  });
-
-  if (!user?.isAdmin) {
+  if (!authUser.isAdmin) {
     throw new ForbiddenError("Admin access required");
   }
 }
@@ -132,6 +128,7 @@ export async function adminGuard(
 export interface AuthUser {
   id: string;
   stellarAddress: string;
+  isAdmin: boolean;
 }
 
 export interface AuthenticatedRequest extends FastifyRequest {
