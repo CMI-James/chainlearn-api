@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import type { FastifyInstance } from "fastify";
 import { buildApp } from "../../src/server.js";
 
 /**
@@ -12,7 +11,7 @@ import { buildApp } from "../../src/server.js";
  * promises (courseId, courseTitle, difficulty, rationale).
  */
 describe("Learning Path API — GET /api/v1/users/me/learning-path (#623)", () => {
-  let app: FastifyInstance;
+  let app: Awaited<ReturnType<typeof buildApp>>;
 
   beforeAll(async () => {
     app = await buildApp();

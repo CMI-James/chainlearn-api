@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import type { FastifyInstance } from "fastify";
 import { buildApp } from "../../src/server.js";
 
 /**
@@ -11,7 +10,7 @@ import { buildApp } from "../../src/server.js";
  * not the usual { success, data } envelope.
  */
 describe("Data Export API — GET /api/v1/users/me/export (#625)", () => {
-  let app: FastifyInstance;
+  let app: Awaited<ReturnType<typeof buildApp>>;
 
   beforeAll(async () => {
     app = await buildApp();

@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import type { FastifyInstance } from "fastify";
 import { buildApp } from "../../src/server.js";
 
 /**
@@ -11,7 +10,7 @@ import { buildApp } from "../../src/server.js";
  * When the response is 200, we assert the full LearningStats shape.
  */
 describe("Learning Stats API — GET /api/v1/users/me/learning-stats (#622)", () => {
-  let app: FastifyInstance;
+  let app: Awaited<ReturnType<typeof buildApp>>;
 
   beforeAll(async () => {
     app = await buildApp();

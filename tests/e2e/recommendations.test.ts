@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import type { FastifyInstance } from "fastify";
 import { buildApp } from "../../src/server.js";
 
 /**
@@ -10,7 +9,7 @@ import { buildApp } from "../../src/server.js";
  * src/modules/users/recommendations.ts for the scoring breakdown.
  */
 describe("Recommendations API — GET /api/v1/users/me/recommendations (#624)", () => {
-  let app: FastifyInstance;
+  let app: Awaited<ReturnType<typeof buildApp>>;
 
   beforeAll(async () => {
     app = await buildApp();
