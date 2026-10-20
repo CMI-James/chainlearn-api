@@ -88,7 +88,7 @@ async function sendWebhook(
       return {
         success: false,
         statusCode: response.status,
-        error: `Response body too large (${arrayBuffer.byteLength} bytes, max ${MAX_RESPONSE_BYTES})`,
+        error: `Client error: ${response.status}`,
       };
     }
 
@@ -98,8 +98,8 @@ async function sendWebhook(
     };
   } catch (err: any) {
     if (err.name === "AbortError") {
-      logger.warn({ url, timeoutMs }, "Webhook request timed out");
-      return { success: false, error: `Request timed out after ${timeoutMs}ms` };
+      logger.warn({ url, timeoutMs: 30_000 }, "Webhook request timed out");
+      return { success: false, error: `Request timed out after 30000ms` };
     }
     logger.error({ url, err }, "Webhook dispatch failed");
     return { success: false, error: err.message };
