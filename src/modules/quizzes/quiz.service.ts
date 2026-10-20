@@ -1,12 +1,21 @@
 import crypto from "node:crypto";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc, sql, isNull } from "drizzle-orm";
 import { db } from "../../config/database.js";
-import { quizzes, quizSubmissions, enrollments } from "../../database/schema.js";
+import {
+  quizzes,
+  quizSubmissions,
+  quizFeedback,
+  enrollments,
+  courses,
+  moduleContent,
+  type CourseModuleDefinition,
+} from "../../database/schema.js";
 import {
   NotFoundError,
   ForbiddenError,
   ConflictError,
   RateLimitError,
+  ValidationError,
 } from "../../utils/errors.js";
 import { withLock } from "../../utils/lock.js";
 import { createQuizProof } from "../../stellar/signatures.js";
@@ -15,6 +24,7 @@ import { redis } from "../../config/redis.js";
 import { generateQuizFromAI } from "./ai-client.js";
 import { sanitizeQuizFeedback } from "../../utils/sanitize.js";
 import { auditLog } from "../../audit/index.js";
+import { dispatchWebhook } from "../../services/webhook-dispatcher.js";
 import { quizSubmissionsTotal } from "../../metrics/index.js";
 import {
   cacheGet,
@@ -23,26 +33,57 @@ import {
   cacheKey,
   cacheKeyPattern,
   cacheInvalidatePattern,
+  cacheGetOrSet,
 } from "../../cache/index.js";
 import {
   PASSING_PERCENTAGE,
   MAX_RETRIES_PER_MODULE_PER_DAY,
   MAX_QUIZ_GENERATIONS_PER_MODULE_PER_HOUR,
   type GenerateQuizBody,
+  type GenerateQuizBatchBody,
   type SubmitQuizBody,
   type QuizWithQuestions,
+  type QuizBatchGenerateEntry,
   type QuizSubmissionResult,
   type QuizQuestion,
   type QuizStats,
+  type SubmitQuizFeedbackBody,
+  type QuizFeedbackEntry,
+  type QuizFeedbackSummaryEntry,
+  type AuthoredQuestion,
+  type AdminQuiz,
+  type AdminQuizDeleteResult,
+  type AdminQuizUpdateBody,
+  type QuizMetadata,
+  type ModuleQuizHistory,
+  type QuizAnalytics,
+  type QuizQuestionAnalytics,
+  type ScoreDistribution,
 } from "./quiz.types.js";
 
 const QUIZ_STATS_TTL_SECONDS = 300;
 
+/** Buckets a 0-100 percentage into a decile label (e.g. "70-79"), with the
+ *  top bucket "90-100" absorbing 100 so it isn't a decile of one. Shared by
+ *  getModuleQuizHistory and getQuizAnalytics so both report distributions on
+ *  the same scale. */
+function scoreDistributionBucket(percentage: number): string {
+  const clamped = Math.min(Math.max(percentage, 0), 100);
+  const lower = clamped === 100 ? 90 : Math.floor(clamped / 10) * 10;
+  const upper = lower === 90 ? 100 : lower + 9;
+  return `${lower}-${upper}`;
+}
+
 type GeneratedQuestion = QuizQuestion & { correctIndex: number };
 type StoredQuestion = GeneratedQuestion & {
-  originalQuestionIndex: number;
-  originalCorrectIndex: number;
-  originalOptions: string[];
+  /** Pre-shuffle bookkeeping, written by shuffleQuestions so an AI-generated
+   *  quiz can be traced back to the order and options the model produced.
+   *  Absent on hand-authored questions (#388) — there is no pre-shuffle
+   *  state to record, and faking identity mappings would misattribute the
+   *  content to the model. Nothing in src/ reads these fields. */
+  originalQuestionIndex?: number;
+  originalCorrectIndex?: number;
+  originalOptions?: string[];
 };
 
 export class QuizService {
@@ -75,7 +116,8 @@ export class QuizService {
       where: and(
         eq(quizzes.courseId, data.courseId),
         eq(quizzes.moduleId, data.moduleId),
-        eq(quizzes.generatedFor, userId)
+        eq(quizzes.generatedFor, userId),
+        isNull(quizzes.archivedAt),
       ),
     });
 
@@ -126,6 +168,47 @@ export class QuizService {
   }
 
   /**
+   * Generate quizzes for several modules of the same course in one request
+   * (#308). Each module goes through the same generateQuiz path — enrollment
+   * check, per-module rate limit, existing-quiz short-circuit, AI generation
+   * with placeholder fallback — sequentially rather than in parallel so a
+   * batch request can't fan out into a burst of concurrent AI service calls.
+   * One module failing (e.g. its own per-module generation rate limit) is
+   * reported in that module's entry rather than aborting the rest of the
+   * batch.
+   */
+  async generateQuizBatch(
+    userId: string,
+    data: GenerateQuizBatchBody
+  ): Promise<QuizBatchGenerateEntry[]> {
+    const results: QuizBatchGenerateEntry[] = [];
+
+    for (const moduleId of data.moduleIds) {
+      try {
+        const quiz = await this.generateQuiz(userId, {
+          courseId: data.courseId,
+          moduleId,
+          difficulty: data.difficulty,
+          numQuestions: data.numQuestions,
+        });
+        results.push({ moduleId, success: true, quiz });
+      } catch (err) {
+        logger.warn(
+          { err, courseId: data.courseId, moduleId },
+          "Batch quiz generation failed for module"
+        );
+        results.push({
+          moduleId,
+          success: false,
+          error: err instanceof Error ? err.message : "Quiz generation failed",
+        });
+      }
+    }
+
+    return results;
+  }
+
+  /**
    * Submit answers for a quiz and calculate the score.
    * Uses distributed locking + database transaction with row-level lock
    * to prevent duplicate submissions from concurrent requests.
@@ -144,6 +227,10 @@ export class QuizService {
 
         if (!quiz) {
           throw new NotFoundError("Quiz");
+        }
+
+        if (quiz.archivedAt) {
+          throw new ForbiddenError("This quiz has been archived");
         }
 
         const enrollment = await tx.query.enrollments.findFirst({
@@ -212,9 +299,13 @@ export class QuizService {
               },
               "Submitted selectedIndex is out of range for this question's options — treating as incorrect"
             );
+            // Use custom feedback if available for incorrect answers
+            const customFeedback = question.incorrectFeedback;
             feedbackParts.push(
               sanitizeQuizFeedback(
-                `Q: "${question.text}" - Incorrect. The correct answer was: "${question.options[question.correctIndex]}"`
+                customFeedback
+                  ? `Q: "${question.text}" - Incorrect. ${customFeedback}`
+                  : `Q: "${question.text}" - Incorrect. The correct answer was: "${question.options[question.correctIndex]}"`
               )
             );
             continue;
@@ -222,13 +313,23 @@ export class QuizService {
 
           if (answer.selectedIndex === question.correctIndex) {
             correctCount++;
-            feedbackParts.push(
-              sanitizeQuizFeedback(`Q: "${question.text}" - Correct!`)
-            );
-          } else {
+            // Use custom feedback if available, otherwise fall back to generic
+            const customFeedback = question.correctFeedback;
             feedbackParts.push(
               sanitizeQuizFeedback(
-                `Q: "${question.text}" - Incorrect. The correct answer was: "${question.options[question.correctIndex]}"`
+                customFeedback
+                  ? `Q: "${question.text}" - Correct! ${customFeedback}`
+                  : `Q: "${question.text}" - Correct!`
+              )
+            );
+          } else {
+            // Use custom feedback if available, otherwise fall back to generic with correct answer
+            const customFeedback = question.incorrectFeedback;
+            feedbackParts.push(
+              sanitizeQuizFeedback(
+                customFeedback
+                  ? `Q: "${question.text}" - Incorrect. ${customFeedback}`
+                  : `Q: "${question.text}" - Incorrect. The correct answer was: "${question.options[question.correctIndex]}"`
               )
             );
           }
@@ -302,6 +403,54 @@ export class QuizService {
         cacheDel(cacheKey("user", "progress", userId)),
         cacheInvalidatePattern(cacheKeyPattern("user", "activity", userId)),
       ]);
+
+      // Dispatch webhook events for quiz submission
+      try {
+        await dispatchWebhook({
+          id: crypto.randomUUID(),
+          event: "quiz.submitted",
+          timestamp: new Date(),
+          data: {
+            userId,
+            quizId,
+            submissionId: result.id,
+            score: result.score,
+            totalQuestions: result.totalQuestions,
+            passed: result.passed,
+          },
+        });
+
+        if (result.passed) {
+          await dispatchWebhook({
+            id: crypto.randomUUID(),
+            event: "quiz.passed",
+            timestamp: new Date(),
+            data: {
+              userId,
+              quizId,
+              submissionId: result.id,
+              score: result.score,
+              totalQuestions: result.totalQuestions,
+            },
+          });
+        } else {
+          await dispatchWebhook({
+            id: crypto.randomUUID(),
+            event: "quiz.failed",
+            timestamp: new Date(),
+            data: {
+              userId,
+              quizId,
+              submissionId: result.id,
+              score: result.score,
+              totalQuestions: result.totalQuestions,
+            },
+          });
+        }
+      } catch (err) {
+        logger.error({ err, userId, quizId }, "Failed to dispatch quiz webhook");
+        // Don't fail the submission if webhook dispatch fails
+      }
 
       return result;
     });
@@ -625,6 +774,1132 @@ export class QuizService {
     return stats;
   }
 
+  /**
+   * Aggregate quiz performance for one module (#415): average score, pass
+   * rate, total attempts, and a score-decile distribution across every quiz
+   * belonging to that module. Admin only. Superseded submissions (#295
+   * retries) are excluded for the same reason as getQuizStats.
+   */
+  async getModuleQuizHistory(
+    courseId: string,
+    moduleId: string,
+  ): Promise<ModuleQuizHistory> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const namespace = "quizzes";
+    const cacheKeyString = cacheKey(namespace, "module-history", courseId, moduleId);
+    const cached = await cacheGet<ModuleQuizHistory>(namespace, cacheKeyString);
+    if (cached) return cached;
+
+    const rows = await db
+      .select({
+        score: quizSubmissions.score,
+        questions: quizzes.questions,
+      })
+      .from(quizSubmissions)
+      .innerJoin(quizzes, eq(quizSubmissions.quizId, quizzes.id))
+      .where(
+        and(
+          eq(quizzes.courseId, courseId),
+          eq(quizzes.moduleId, moduleId),
+          eq(quizSubmissions.superseded, false),
+        ),
+      );
+
+    let percentageSum = 0;
+    let passCount = 0;
+    const scoreDistribution: Record<string, number> = {};
+
+    for (const row of rows) {
+      const totalQuestions = Array.isArray(row.questions) ? row.questions.length : 0;
+      const percentage =
+        totalQuestions > 0 && row.score != null
+          ? Math.round((row.score / totalQuestions) * 100)
+          : 0;
+
+      percentageSum += percentage;
+      if (percentage >= PASSING_PERCENTAGE) passCount++;
+      const bucket = scoreDistributionBucket(percentage);
+      scoreDistribution[bucket] = (scoreDistribution[bucket] ?? 0) + 1;
+    }
+
+    const totalAttempts = rows.length;
+    const history: ModuleQuizHistory = {
+      moduleId,
+      totalAttempts,
+      averageScore: totalAttempts > 0 ? Math.round(percentageSum / totalAttempts) : 0,
+      passRate: totalAttempts > 0 ? Math.round((passCount / totalAttempts) * 100) : 0,
+      scoreDistribution,
+    };
+
+    await cacheSet(cacheKeyString, history, QUIZ_STATS_TTL_SECONDS);
+
+    return history;
+  }
+
+  /**
+   * Question-by-question analytics for a single quiz (#417): correct rate,
+   * the most commonly picked wrong answers, and a score distribution across
+   * that quiz's own attempts. Admin only.
+   *
+   * There is no per-question timing data anywhere in the submission path
+   * (submitQuizSchema only carries questionId + selectedIndex), so "average
+   * time per question" from the issue's acceptance criteria is intentionally
+   * left out — capturing it would mean a schema change plus a client change
+   * to record per-question timestamps, which is bigger than this fix.
+   */
+  async getQuizAnalytics(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+  ): Promise<QuizAnalytics> {
+    const quiz = await this.assertQuizInModule(courseId, moduleId, quizId);
+
+    const namespace = "quizzes";
+    const cacheKeyString = cacheKey(namespace, "analytics", quizId);
+    const cached = await cacheGet<QuizAnalytics>(namespace, cacheKeyString);
+    if (cached) return cached;
+
+    const submissions = await db
+      .select({ answers: quizSubmissions.answers, score: quizSubmissions.score })
+      .from(quizSubmissions)
+      .where(
+        and(
+          eq(quizSubmissions.quizId, quizId),
+          eq(quizSubmissions.superseded, false),
+        ),
+      );
+
+    const questions = (quiz.questions ?? []) as StoredQuestion[];
+    const totalQuestionsCount = questions.length;
+
+    const scoreDistribution: Record<string, number> = {};
+    const perQuestion = new Map<
+      string,
+      { total: number; correct: number; wrong: Map<number, number> }
+    >();
+    for (const question of questions) {
+      perQuestion.set(question.id, { total: 0, correct: 0, wrong: new Map() });
+    }
+
+    for (const submission of submissions) {
+      const percentage =
+        totalQuestionsCount > 0 && submission.score != null
+          ? Math.round((submission.score / totalQuestionsCount) * 100)
+          : 0;
+      const bucket = scoreDistributionBucket(percentage);
+      scoreDistribution[bucket] = (scoreDistribution[bucket] ?? 0) + 1;
+
+      const answers = (submission.answers ?? []) as Array<{
+        questionId: string;
+        selectedIndex: number;
+      }>;
+      for (const answer of answers) {
+        const entry = perQuestion.get(answer.questionId);
+        if (!entry) continue;
+        entry.total++;
+        const question = questions.find((q) => q.id === answer.questionId);
+        if (question && answer.selectedIndex === question.correctIndex) {
+          entry.correct++;
+        } else {
+          entry.wrong.set(
+            answer.selectedIndex,
+            (entry.wrong.get(answer.selectedIndex) ?? 0) + 1,
+          );
+        }
+      }
+    }
+
+    const MAX_COMMON_WRONG_ANSWERS = 3;
+    const questionAnalytics: QuizQuestionAnalytics[] = questions.map((question) => {
+      const entry = perQuestion.get(question.id) ?? {
+        total: 0,
+        correct: 0,
+        wrong: new Map<number, number>(),
+      };
+      const commonWrongAnswers = [...entry.wrong.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, MAX_COMMON_WRONG_ANSWERS)
+        .map(([selectedIndex, count]) => ({ selectedIndex, count }));
+
+      return {
+        questionId: question.id,
+        questionText: question.text,
+        totalAnswered: entry.total,
+        correctCount: entry.correct,
+        correctRate: entry.total > 0 ? Math.round((entry.correct / entry.total) * 100) : 0,
+        commonWrongAnswers,
+      };
+    });
+
+    const analytics: QuizAnalytics = {
+      quizId,
+      totalAttempts: submissions.length,
+      scoreDistribution,
+      questions: questionAnalytics,
+    };
+
+    await cacheSet(cacheKeyString, analytics, QUIZ_STATS_TTL_SECONDS);
+
+    return analytics;
+  }
+
+  /**
+   * Submit feedback on a specific quiz question (#331): "this question is
+   * unclear", "wrong answer marked as correct", or something else.
+   *
+   * One submission per (quiz, question, user) — a second attempt is
+   * rejected with a ConflictError rather than overwriting the first, so a
+   * question's feedback count reflects distinct reporters.
+   */
+  async submitFeedback(
+    userId: string,
+    quizId: string,
+    data: SubmitQuizFeedbackBody,
+  ): Promise<QuizFeedbackEntry> {
+    const quiz = await db.query.quizzes.findFirst({
+      where: eq(quizzes.id, quizId),
+    });
+    if (!quiz) {
+      throw new NotFoundError("Quiz");
+    }
+
+    const questions = (quiz.questions ?? []) as StoredQuestion[];
+    if (!questions.some((q) => q.id === data.questionId)) {
+      throw new NotFoundError("Question");
+    }
+
+    const existing = await db.query.quizFeedback.findFirst({
+      where: and(
+        eq(quizFeedback.quizId, quizId),
+        eq(quizFeedback.questionId, data.questionId),
+        eq(quizFeedback.userId, userId),
+      ),
+    });
+    if (existing) {
+      throw new ConflictError("Feedback already submitted for this question");
+    }
+
+    try {
+      const [row] = await db
+        .insert(quizFeedback)
+        .values({
+          quizId,
+          questionId: data.questionId,
+          userId,
+          type: data.type,
+          comment: data.comment ?? null,
+        })
+        .returning();
+
+      await auditLog("quiz.feedback.submitted", {
+        userId,
+        courseId: quiz.courseId,
+      });
+
+      return row as QuizFeedbackEntry;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      // 23505 = unique_violation — a concurrent submission for the same
+      // (quiz, question, user) beat this one to the pre-check above.
+      if (code === "23505") {
+        throw new ConflictError("Feedback already submitted for this question");
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Per-question feedback counts for a quiz, for admins reviewing which
+   * questions need work (#331).
+   */
+  async getFeedbackSummary(
+    quizId: string,
+    questionId?: string,
+  ): Promise<QuizFeedbackSummaryEntry[]> {
+    const quiz = await db.query.quizzes.findFirst({
+      where: eq(quizzes.id, quizId),
+    });
+    if (!quiz) {
+      throw new NotFoundError("Quiz");
+    }
+
+    const conditions = [eq(quizFeedback.quizId, quizId)];
+    if (questionId) {
+      conditions.push(eq(quizFeedback.questionId, questionId));
+    }
+
+    const rows = await db
+      .select({
+        questionId: quizFeedback.questionId,
+        type: quizFeedback.type,
+      })
+      .from(quizFeedback)
+      .where(and(...conditions));
+
+    const byQuestion = new Map<string, QuizFeedbackSummaryEntry>();
+    for (const row of rows) {
+      let entry = byQuestion.get(row.questionId);
+      if (!entry) {
+        entry = {
+          questionId: row.questionId,
+          total: 0,
+          counts: { unclear: 0, wrong: 0, other: 0 },
+        };
+        byQuestion.set(row.questionId, entry);
+      }
+      entry.total++;
+      entry.counts[row.type as QuizFeedbackEntry["type"]]++;
+    }
+
+    return Array.from(byQuestion.values());
+  }
+
+  // ─── Admin: Manual Quiz Authoring (#388) ─────────────────────────────────
+
+  /**
+   * Verify the course exists and that `moduleId` is a module a learner can
+   * actually reach.
+   *
+   * The check is conditional on the course having module definitions at
+   * all. A course authored only through the legacy `courseModules` field has
+   * no `modules` array to match against, and rejecting every moduleId there
+   * would make the endpoint unusable for those courses. When definitions do
+   * exist, the match is enforced: a quiz whose moduleId isn't one of them is
+   * content no learner can open, and it would also silently fail
+   * CourseService's publish check, which counts quizzes by module.
+   */
+  private async assertModuleBelongsToCourse(
+    courseId: string,
+    moduleId: string,
+  ): Promise<void> {
+    const course = await db.query.courses.findFirst({
+      where: eq(courses.id, courseId),
+    });
+    if (!course) {
+      throw new NotFoundError("Course");
+    }
+
+    const modules = (course.modules ?? []) as CourseModuleDefinition[];
+    if (modules.length === 0) return;
+
+    if (!modules.some((module) => module.id === moduleId)) {
+      throw new ValidationError({
+        moduleId: [
+          `Module "${moduleId}" is not one of this course's modules. Create the module first, or use one of: ${modules
+            .map((module) => module.id)
+            .join(", ")}`,
+        ],
+      });
+    }
+  }
+
+  /**
+   * Invalidate everything a course's set of quizzes feeds into.
+   *
+   * Course-wide keys are dropped exactly. The one view deliberately left
+   * alone is `user:modules:<userId>:<courseId>` (the per-user module list
+   * with completion status): it's keyed by user first, so clearing it would
+   * mean fanning a SCAN or a per-enrollee write over the whole roster for
+   * every authoring change. Its own 60s TTL bounds the staleness — the same
+   * tradeoff QuizService.submitQuiz already makes for a submission.
+   *
+   * Also clears getModuleQuizHistory's (#415) and getQuizAnalytics's (#417)
+   * 5-minute caches course-wide via pattern match, since a write here
+   * (archiving via #416 in particular) changes which submissions count
+   * toward both views and which quizzes are even eligible.
+   */
+  private async invalidateQuizCaches(courseId: string): Promise<void> {
+    const invalidations = await Promise.allSettled([
+      // Both the course-scoped and the all-courses aggregate.
+      cacheInvalidatePattern(cacheKeyPattern("quizzes", "stats")),
+      // Module-level history (#415) and per-quiz analytics (#417) — an
+      // admin editing/archiving questions changes what both would report.
+      cacheInvalidatePattern(cacheKeyPattern("quizzes", "module-history")),
+      cacheInvalidatePattern(cacheKeyPattern("quizzes", "analytics")),
+      // Enrollment status derives its module list from quizzes.
+      cacheInvalidatePattern(cacheKeyPattern("user", "enrollment-status")),
+      cacheDel(cacheKey("courses", "detail", courseId)),
+      // #415/#417: module-history and per-quiz analytics aggregates.
+      cacheInvalidatePattern(cacheKeyPattern("quizzes", "module-history")),
+      cacheInvalidatePattern(cacheKeyPattern("quizzes", "analytics")),
+    ]);
+    const failed = invalidations.filter((r) => r.status === "rejected");
+    if (failed.length > 0) {
+      logger.warn(
+        { courseId, failedCount: failed.length },
+        "Post-quiz-write cache invalidation had failures — affected views may serve stale data until their TTL expires",
+      );
+    }
+  }
+
+  /**
+   * Every quiz on a course module, newest first, for the admin authoring UI
+   * (#388). Includes `correctIndex` and the submission count, neither of
+   * which learner-facing endpoints expose.
+   */
+  async listModuleQuizzes(
+    courseId: string,
+    moduleId: string,
+  ): Promise<AdminQuiz[]> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const rows = await db
+      .select({
+        id: quizzes.id,
+        courseId: quizzes.courseId,
+        moduleId: quizzes.moduleId,
+        questions: quizzes.questions,
+        generatedFor: quizzes.generatedFor,
+        archivedAt: quizzes.archivedAt,
+        metadata: quizzes.metadata,
+        createdAt: quizzes.createdAt,
+        submissionCount: sql<number>`(
+          SELECT count(*)::int FROM ${quizSubmissions}
+          WHERE ${quizSubmissions.quizId} = ${quizzes.id}
+        )`,
+      })
+      .from(quizzes)
+      .where(and(eq(quizzes.courseId, courseId), eq(quizzes.moduleId, moduleId)))
+      .orderBy(desc(quizzes.createdAt));
+
+    return rows.map((row) => this.toAdminQuiz(row));
+  }
+
+  private toAdminQuiz(row: {
+    id: string;
+    courseId: string;
+    moduleId: string;
+    questions: unknown;
+    generatedFor: string | null;
+    archivedAt?: Date | null;
+    metadata?: QuizMetadata | null;
+    createdAt: Date;
+    submissionCount: number;
+  }): AdminQuiz {
+    const questions = (Array.isArray(row.questions) ? row.questions : []) as StoredQuestion[];
+    return {
+      id: row.id,
+      courseId: row.courseId,
+      moduleId: row.moduleId,
+      questions: questions.map((question) => ({
+        id: question.id,
+        text: question.text,
+        options: question.options ?? [],
+        correctIndex: question.correctIndex,
+        ...(question.correctFeedback && {
+          correctFeedback: question.correctFeedback,
+        }),
+        ...(question.incorrectFeedback && {
+          incorrectFeedback: question.incorrectFeedback,
+        }),
+      })),
+      questionCount: questions.length,
+      generatedFor: row.generatedFor,
+      submissionCount: row.submissionCount,
+      archivedAt: row.archivedAt ?? null,
+      metadata: row.metadata ?? {},
+      createdAt: row.createdAt,
+    };
+  }
+
+  /**
+   * Create a hand-authored quiz for a course module (#388).
+   *
+   * `generatedFor` is deliberately left null. AI quizzes are per-learner
+   * (`generateQuiz` looks for an existing quiz matching course + module +
+   * user), so a quiz with a user attached belongs to that one learner. An
+   * admin-authored quiz has no such owner and is course-wide content.
+   *
+   * Questions are stored in the author's order without shuffling. Shuffling
+   * exists to stop a learner pattern-matching an AI-generated set; for
+   * hand-written content the order is usually meaningful (a walkthrough, a
+   * difficulty ramp) and an admin editing a specific question expects to
+   * find it where they put it.
+   */
+  async createModuleQuiz(
+    courseId: string,
+    moduleId: string,
+    questions: AuthoredQuestion[],
+  ): Promise<AdminQuiz> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const [quiz] = await db
+      .insert(quizzes)
+      .values({ courseId, moduleId, questions })
+      .returning();
+
+    await this.invalidateQuizCaches(courseId);
+    await auditLog("course.quiz.created", {
+      courseId,
+      moduleId,
+      quizId: quiz.id,
+      questionCount: questions.length,
+    });
+    logger.info(
+      { courseId, moduleId, quizId: quiz.id, questionCount: questions.length },
+      "Quiz created by admin",
+    );
+
+    return this.toAdminQuiz({
+      id: quiz.id,
+      courseId: quiz.courseId,
+      moduleId: quiz.moduleId,
+      questions: quiz.questions,
+      generatedFor: quiz.generatedFor,
+      archivedAt: quiz.archivedAt,
+      metadata: quiz.metadata ?? {},
+      createdAt: quiz.createdAt,
+      submissionCount: 0,
+    });
+  }
+
+  /**
+   * Replace a quiz's questions with a hand-authored set (#388).
+   *
+   * The `questions` body is a full replacement, not a patch — sending
+   * `questions` replaces the array wholesale. Partial edits are what the
+   * alternative would be for, and this keeps the stored document consistent
+   * with what's validated.
+   *
+   * This rewrites a quiz learners may already have answered. Existing
+   * submissions keep their recorded score (it's a stored integer, not
+   * recomputed), but a submission made against the old questions can no
+   * longer be explained by the questions now on the quiz. The audit log
+   * records the before/after question counts for exactly that reason.
+   */
+  async updateModuleQuiz(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+    questions: AuthoredQuestion[],
+  ): Promise<AdminQuiz> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+    const existing = await this.assertQuizInModule(courseId, moduleId, quizId);
+
+    const [updated] = await db
+      .update(quizzes)
+      .set({ questions })
+      .where(eq(quizzes.id, existing.id))
+      .returning();
+
+    await this.invalidateQuizCaches(courseId);
+    await auditLog("course.quiz.updated", {
+      courseId,
+      moduleId,
+      quizId: existing.id,
+      questionCount: questions.length,
+    });
+    logger.info(
+      {
+        courseId,
+        moduleId,
+        quizId: existing.id,
+        previousQuestionCount: (existing.questions as unknown[]).length,
+        questionCount: questions.length,
+      },
+      "Quiz updated by admin",
+    );
+
+    const submissionCount = await this.countSubmissions(existing.id);
+    return this.toAdminQuiz({
+      id: updated.id,
+      courseId: updated.courseId,
+      moduleId: updated.moduleId,
+      questions: updated.questions,
+      generatedFor: updated.generatedFor,
+      archivedAt: updated.archivedAt,
+      metadata: (updated.metadata ?? {}) as QuizMetadata,
+      createdAt: updated.createdAt,
+      submissionCount,
+    });
+  }
+
+  /**
+   * Update an existing quiz in one transaction (#413): replace its questions,
+   * merge metadata, and/or archive it. New questions are validated before
+   * this runs. Archiving hides the quiz from learners without deleting
+   * submissions.
+   */
+  async updateModuleQuizDetails(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+    body: AdminQuizUpdateBody,
+  ): Promise<AdminQuiz> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const updated = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(quizzes)
+        .where(eq(quizzes.id, quizId))
+        .for("update");
+
+      if (
+        !existing ||
+        existing.courseId !== courseId ||
+        existing.moduleId !== moduleId
+      ) {
+        throw new NotFoundError("Quiz");
+      }
+
+      const currentMetadata = (existing.metadata ?? {}) as QuizMetadata;
+      const metadata = body.metadata
+        ? { ...currentMetadata, ...body.metadata }
+        : currentMetadata;
+
+      let archivedAt = existing.archivedAt;
+      if (body.archived === true) {
+        archivedAt = existing.archivedAt ?? new Date();
+      } else if (body.archived === false) {
+        archivedAt = null;
+      }
+
+      const [row] = await tx
+        .update(quizzes)
+        .set({
+          ...(body.questions ? { questions: body.questions } : {}),
+          ...(body.metadata ? { metadata } : {}),
+          ...(body.archived !== undefined ? { archivedAt } : {}),
+        })
+        .where(eq(quizzes.id, existing.id))
+        .returning();
+
+      return row;
+    });
+
+    const changes: string[] = [];
+    if (body.questions) changes.push("questions");
+    if (body.metadata) changes.push("metadata");
+    if (body.archived !== undefined) changes.push("archived");
+
+    await this.invalidateQuizCaches(courseId);
+    await auditLog("course.quiz.updated", {
+      courseId,
+      moduleId,
+      quizId: updated.id,
+      questionCount: Array.isArray(updated.questions)
+        ? updated.questions.length
+        : 0,
+      changes,
+    });
+    logger.info(
+      { courseId, moduleId, quizId: updated.id, changes },
+      "Quiz updated by admin",
+    );
+
+    const submissionCount = await this.countSubmissions(updated.id);
+    return this.toAdminQuiz({
+      id: updated.id,
+      courseId: updated.courseId,
+      moduleId: updated.moduleId,
+      questions: updated.questions,
+      generatedFor: updated.generatedFor,
+      archivedAt: updated.archivedAt,
+      metadata: (updated.metadata ?? {}) as QuizMetadata,
+      createdAt: updated.createdAt,
+      submissionCount,
+    });
+  }
+
+  /**
+   * Append one validated question to a quiz (#411). The questions JSONB
+   * array is rewritten inside a row lock so two adds cannot drop each
+   * other. Archived quizzes are rejected — unarchive first.
+   */
+  async addModuleQuizQuestion(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+    question: AuthoredQuestion,
+  ): Promise<AdminQuiz> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const updated = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(quizzes)
+        .where(eq(quizzes.id, quizId))
+        .for("update");
+
+      if (
+        !existing ||
+        existing.courseId !== courseId ||
+        existing.moduleId !== moduleId
+      ) {
+        throw new NotFoundError("Quiz");
+      }
+
+      if (existing.archivedAt) {
+        throw new ValidationError({
+          quizId: [
+            "Archived quizzes cannot accept new questions. Unarchive the quiz first.",
+          ],
+        });
+      }
+
+      const questions = (
+        Array.isArray(existing.questions) ? existing.questions : []
+      ) as StoredQuestion[];
+
+      if (questions.some((existingQuestion) => existingQuestion.id === question.id)) {
+        throw new ConflictError(
+          `Question id "${question.id}" already exists on this quiz`,
+        );
+      }
+
+      if (questions.length >= 50) {
+        throw new ValidationError({
+          questions: ["A quiz can have at most 50 questions"],
+        });
+      }
+
+      const [row] = await tx
+        .update(quizzes)
+        .set({ questions: [...questions, question] })
+        .where(eq(quizzes.id, existing.id))
+        .returning();
+
+      return row;
+    });
+
+    await this.invalidateQuizCaches(courseId);
+    await auditLog("course.quiz.question.added", {
+      courseId,
+      moduleId,
+      quizId: updated.id,
+      questionCount: Array.isArray(updated.questions)
+        ? updated.questions.length
+        : 0,
+    });
+    logger.info(
+      { courseId, moduleId, quizId: updated.id, questionId: question.id },
+      "Question added to quiz by admin",
+    );
+
+    const submissionCount = await this.countSubmissions(updated.id);
+    return this.toAdminQuiz({
+      id: updated.id,
+      courseId: updated.courseId,
+      moduleId: updated.moduleId,
+      questions: updated.questions,
+      generatedFor: updated.generatedFor,
+      archivedAt: updated.archivedAt,
+      metadata: (updated.metadata ?? {}) as QuizMetadata,
+      createdAt: updated.createdAt,
+      submissionCount,
+    });
+  }
+
+  /**
+   * Delete a quiz, every submission against it, and any module content
+   * item that points at it (#414, #388).
+   *
+   * Submissions are removed in the same transaction as the quiz row so a
+   * failure cannot leave an orphaned submission or a quiz whose history
+   * was already wiped. Reward history is read from quiz_submissions, so
+   * the counts of what went with the quiz are returned and audit-logged.
+   */
+  async deleteModuleQuiz(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+  ): Promise<AdminQuizDeleteResult> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const deleted = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(quizzes)
+        .where(eq(quizzes.id, quizId))
+        .for("update");
+
+      if (
+        !existing ||
+        existing.courseId !== courseId ||
+        existing.moduleId !== moduleId
+      ) {
+        throw new NotFoundError("Quiz");
+      }
+
+      const removedSubmissions = await tx
+        .delete(quizSubmissions)
+        .where(eq(quizSubmissions.quizId, existing.id))
+        .returning({ rewardClaimed: quizSubmissions.rewardClaimed });
+
+      // Module content of type "quiz" can reference this row by id. Drop
+      // those items in the same transaction so the quiz is gone from the
+      // module, not only from the quizzes table.
+      await tx
+        .delete(moduleContent)
+        .where(
+          and(
+            eq(moduleContent.courseId, courseId),
+            eq(moduleContent.moduleId, moduleId),
+            sql`${moduleContent.content}->>'quizId' = ${existing.id}`,
+          ),
+        );
+
+      await tx.delete(quizzes).where(eq(quizzes.id, existing.id));
+
+      return {
+        quiz: existing,
+        submissionsDeleted: removedSubmissions.length,
+        claimedRewardsDeleted: removedSubmissions.filter(
+          (row) => row.rewardClaimed,
+        ).length,
+      };
+    });
+
+    await this.invalidateQuizCaches(courseId);
+    await auditLog("course.quiz.deleted", {
+      courseId,
+      moduleId,
+      quizId: deleted.quiz.id,
+      questionCount: Array.isArray(deleted.quiz.questions)
+        ? deleted.quiz.questions.length
+        : 0,
+      submissionsDeleted: deleted.submissionsDeleted,
+      claimedRewardsDeleted: deleted.claimedRewardsDeleted,
+    });
+    logger.info(
+      {
+        courseId,
+        moduleId,
+        quizId: deleted.quiz.id,
+        submissionsDeleted: deleted.submissionsDeleted,
+      },
+      "Quiz deleted by admin",
+    );
+
+    return {
+      quizId: deleted.quiz.id,
+      courseId,
+      moduleId,
+      submissionsDeleted: deleted.submissionsDeleted,
+      claimedRewardsDeleted: deleted.claimedRewardsDeleted,
+      deletedAt: new Date(),
+    };
+  }
+
+  private async countSubmissions(quizId: string): Promise<number> {
+    const [row] = await db
+      .select({ value: sql<number>`count(*)::int` })
+      .from(quizSubmissions)
+      .where(eq(quizSubmissions.quizId, quizId));
+    return row?.value ?? 0;
+  }
+
+  /**
+   * Archive or unarchive a quiz via a dedicated endpoint (#416).
+   *
+   * This is a thin wrapper over updateModuleQuizDetails (#413) rather than
+   * new logic: archiving is already atomic (single UPDATE inside a row
+   * lock), already hides the quiz from learners (isNull(quizzes.archivedAt)
+   * filters in generateQuiz/submitQuiz), already preserves submissions
+   * (nothing is deleted), and already audit-logs via "course.quiz.updated"
+   * with changes: ["archived"]. #416 asks for the action to live at its own
+   * URL (POST .../quizzes/:quizId/archive) for discoverability — an admin
+   * client shouldn't need to know a generic update endpoint doubles as an
+   * archive action — but the underlying write is intentionally the same
+   * code path so there is exactly one place that knows how to archive a
+   * quiz.
+   */
+  async archiveModuleQuiz(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+    archived: boolean,
+  ): Promise<AdminQuiz> {
+    return this.updateModuleQuizDetails(courseId, moduleId, quizId, {
+      archived,
+    });
+  }
+
+  /**
+   * Aggregate quiz stats across every quiz in a course module (#415):
+   * average score, pass rate, total attempts, and a score distribution.
+   * Cached for 5 minutes, keyed by courseId+moduleId so different modules
+   * don't collide (mirrors getQuizStats's cache-aside pattern above).
+   *
+   * Scoped to this module's quizzes specifically (unlike getQuizStats,
+   * which is course- or platform-wide) — a course creator reviewing one
+   * module's difficulty shouldn't have other modules' scores mixed in.
+   * Superseded submissions (#295 retries) are excluded for the same reason
+   * getQuizStats excludes them: a retried quiz's stale attempt would
+   * otherwise double-count against the same learner's real result.
+   */
+  async getModuleQuizHistory(
+    courseId: string,
+    moduleId: string,
+  ): Promise<ModuleQuizHistory> {
+    await this.assertModuleBelongsToCourse(courseId, moduleId);
+
+    const cacheKeyString = cacheKey(
+      "quizzes",
+      "module-history",
+      courseId,
+      moduleId,
+    );
+
+    return cacheGetOrSet(
+      "quizzes",
+      cacheKeyString,
+      async () => {
+        const rows = await db
+          .select({
+            score: quizSubmissions.score,
+            questions: quizzes.questions,
+            quizId: quizzes.id,
+          })
+          .from(quizSubmissions)
+          .innerJoin(quizzes, eq(quizSubmissions.quizId, quizzes.id))
+          .where(
+            and(
+              eq(quizzes.courseId, courseId),
+              eq(quizzes.moduleId, moduleId),
+              eq(quizSubmissions.superseded, false),
+            ),
+          );
+
+        const percentages = rows.map((row) => {
+          const totalQuestions = Array.isArray(row.questions)
+            ? row.questions.length
+            : 0;
+          return totalQuestions > 0 && row.score != null
+            ? Math.round((row.score / totalQuestions) * 100)
+            : 0;
+        });
+
+        const quizIds = new Set(rows.map((row) => row.quizId));
+        const passCount = percentages.filter(
+          (p) => p >= PASSING_PERCENTAGE,
+        ).length;
+        const totalAttempts = percentages.length;
+
+        return {
+          courseId,
+          moduleId,
+          quizCount: quizIds.size,
+          totalAttempts,
+          averageScore:
+            totalAttempts > 0
+              ? Math.round(
+                  percentages.reduce((sum, p) => sum + p, 0) / totalAttempts,
+                )
+              : 0,
+          passRate:
+            totalAttempts > 0
+              ? Math.round((passCount / totalAttempts) * 100)
+              : 0,
+          scoreDistribution: this.buildScoreDistribution(percentages),
+        };
+      },
+      QUIZ_STATS_TTL_SECONDS,
+    );
+  }
+
+  /**
+   * Detailed analytics for one specific quiz (#417): question-by-question
+   * correct rate and most common wrong answer, score distribution, and
+   * attempt patterns (current vs superseded, using quizSubmissions.superseded
+   * the same way retryQuiz sets it). Cached for 5 minutes like
+   * getModuleQuizHistory.
+   *
+   * Unlike getModuleQuizHistory, superseded submissions are NOT excluded
+   * from the top-level attempt counts (totalAttempts includes them,
+   * currentAttempts/supersededAttempts break them out) — #417 explicitly
+   * asks for "attempt patterns (e.g. retry counts)", which requires seeing
+   * both current and superseded rows rather than filtering superseded ones
+   * out. Score distribution and the per-question breakdown are computed
+   * only from current (non-superseded) submissions, matching
+   * getModuleQuizHistory's and getQuizStats's convention that "the score"
+   * for a learner is their current attempt, not a stale retried one.
+   *
+   * Per-question average time is not derivable: quizSubmissions.answers only
+   * stores { questionId, selectedIndex } per answer (submitQuizSchema), with
+   * no per-answer timestamp captured anywhere in submitQuiz. Rather than
+   * fabricate a number, averageTimeSeconds is always null and
+   * perQuestionTimingAvailable is false on the response so callers can
+   * render "not tracked" instead of misreading a missing value as 0.
+   */
+  async getQuizAnalytics(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+  ): Promise<QuizAnalytics> {
+    const quiz = await this.assertQuizInModule(courseId, moduleId, quizId);
+
+    const cacheKeyString = cacheKey("quizzes", "analytics", quizId);
+
+    return cacheGetOrSet(
+      "quizzes",
+      cacheKeyString,
+      async () => {
+        const submissions = await db
+          .select({
+            score: quizSubmissions.score,
+            answers: quizSubmissions.answers,
+            superseded: quizSubmissions.superseded,
+          })
+          .from(quizSubmissions)
+          .where(eq(quizSubmissions.quizId, quizId));
+
+        const questions = (
+          Array.isArray(quiz.questions) ? quiz.questions : []
+        ) as StoredQuestion[];
+        const totalQuestions = questions.length;
+
+        const current = submissions.filter((s) => !s.superseded);
+        const superseded = submissions.filter((s) => s.superseded);
+
+        const percentages = current.map((row) =>
+          totalQuestions > 0 && row.score != null
+            ? Math.round((row.score / totalQuestions) * 100)
+            : 0,
+        );
+        const passCount = percentages.filter(
+          (p) => p >= PASSING_PERCENTAGE,
+        ).length;
+
+        const questionAnalytics = questions.map((question) =>
+          this.buildQuestionAnalytics(question, current),
+        );
+
+        return {
+          quizId,
+          courseId,
+          moduleId,
+          totalAttempts: submissions.length,
+          currentAttempts: current.length,
+          supersededAttempts: superseded.length,
+          averageScore:
+            percentages.length > 0
+              ? Math.round(
+                  percentages.reduce((sum, p) => sum + p, 0) /
+                    percentages.length,
+                )
+              : 0,
+          passRate:
+            percentages.length > 0
+              ? Math.round((passCount / percentages.length) * 100)
+              : 0,
+          scoreDistribution: this.buildScoreDistribution(percentages),
+          questions: questionAnalytics,
+          perQuestionTimingAvailable: false,
+        };
+      },
+      QUIZ_STATS_TTL_SECONDS,
+    );
+  }
+
+  /**
+   * Correct rate and most common wrong answer for one question, across a
+   * set of (non-superseded) submissions. A submission that never answered
+   * this questionId (skipped, or an unrecognized id per submitQuiz's
+   * lenient handling of stale questionIds) simply doesn't contribute a row
+   * — `totalAnswered` is how many submissions actually included this
+   * question, not the submission count.
+   */
+  private buildQuestionAnalytics(
+    question: StoredQuestion,
+    submissions: Array<{ answers: unknown }>,
+  ): QuizQuestionAnalytics {
+    let totalAnswered = 0;
+    let correctCount = 0;
+    const wrongAnswerCounts = new Map<number, number>();
+
+    for (const submission of submissions) {
+      const answers = Array.isArray(submission.answers)
+        ? (submission.answers as Array<{
+            questionId: string;
+            selectedIndex: number;
+          }>)
+        : [];
+      const answer = answers.find((a) => a?.questionId === question.id);
+      if (!answer) continue;
+
+      totalAnswered++;
+      if (answer.selectedIndex === question.correctIndex) {
+        correctCount++;
+      } else {
+        wrongAnswerCounts.set(
+          answer.selectedIndex,
+          (wrongAnswerCounts.get(answer.selectedIndex) ?? 0) + 1,
+        );
+      }
+    }
+
+    let commonWrongAnswer: QuizQuestionAnalytics["commonWrongAnswer"] = null;
+    for (const [selectedIndex, count] of wrongAnswerCounts) {
+      if (!commonWrongAnswer || count > commonWrongAnswer.count) {
+        commonWrongAnswer = { selectedIndex, count };
+      }
+    }
+
+    return {
+      questionId: question.id,
+      totalAnswered,
+      correctCount,
+      correctRate:
+        totalAnswered > 0 ? Math.round((correctCount / totalAnswered) * 100) : 0,
+      commonWrongAnswer,
+      averageTimeSeconds: null,
+    };
+  }
+
+  /** Buckets a list of percentage scores (0-100) into
+   *  SCORE_DISTRIBUTION_BUCKETS. Shared by getModuleQuizHistory (#415) and
+   *  getQuizAnalytics (#417) so both endpoints report distribution the same
+   *  way. */
+  private buildScoreDistribution(percentages: number[]): ScoreDistribution {
+    const distribution: ScoreDistribution = {
+      "0-20": 0,
+      "21-40": 0,
+      "41-60": 0,
+      "61-80": 0,
+      "81-100": 0,
+    };
+
+    for (const percentage of percentages) {
+      const clamped = Math.max(0, Math.min(100, percentage));
+      if (clamped <= 20) distribution["0-20"]++;
+      else if (clamped <= 40) distribution["21-40"]++;
+      else if (clamped <= 60) distribution["41-60"]++;
+      else if (clamped <= 80) distribution["61-80"]++;
+      else distribution["81-100"]++;
+    }
+
+    return distribution;
+  }
+
+  /**
+   * Load a quiz and assert it belongs to the course + module in the URL.
+   * Scoping by all three means a quiz id from another course reports 404
+   * here rather than being editable through the wrong course's admin URL.
+   */
+  private async assertQuizInModule(
+    courseId: string,
+    moduleId: string,
+    quizId: string,
+  ): Promise<typeof quizzes.$inferSelect> {
+    const [quiz] = await db
+      .select()
+      .from(quizzes)
+      .where(eq(quizzes.id, quizId));
+
+    if (
+      !quiz ||
+      quiz.courseId !== courseId ||
+      quiz.moduleId !== moduleId
+    ) {
+      throw new NotFoundError("Quiz");
+    }
+
+    return quiz;
+  }
+
   private createPlaceholderQuestions(
     courseId: string,
     moduleId: string
@@ -707,7 +1982,13 @@ export class QuizService {
   }
 
   private toClientQuestions(questions: StoredQuestion[]): QuizQuestion[] {
-    return questions.map(({ id, text, options }) => ({ id, text, options }));
+    return questions.map(({ id, text, options, correctFeedback, incorrectFeedback }) => ({
+      id,
+      text,
+      options,
+      ...(correctFeedback && { correctFeedback }),
+      ...(incorrectFeedback && { incorrectFeedback }),
+    }));
   }
 }
 

@@ -1,6 +1,8 @@
 import type { FastifyRateLimitOptions, RateLimitOptions } from "@fastify/rate-limit";
 import type { FastifyRequest } from "fastify";
 import { config } from "../config/index.js";
+import type { AuthenticatedRequest } from "./auth.js";
+import { auditLog } from "../audit/index.js";
 
 const errorResponseBuilder = (
   _request: FastifyRequest,
@@ -17,10 +19,19 @@ export function rateLimitOptions(): FastifyRateLimitOptions {
     timeWindow: config.RATE_LIMIT_WINDOW_MS,
     keyGenerator: (request: FastifyRequest) => {
       // Prefer authenticated user id, fall back to IP
-      const authReq = request as any;
+      const authReq = request as AuthenticatedRequest;
       return authReq.authUser?.id ?? request.ip;
     },
     errorResponseBuilder,
+    onExceeded: (request: FastifyRequest) => {
+      const authReq = request as AuthenticatedRequest;
+      auditLog("rate_limit.exceeded", {
+        ip: request.ip,
+        userId: authReq.authUser?.id,
+        url: request.url,
+        method: request.method,
+      }).catch(() => {});
+    },
   };
 }
 
@@ -51,7 +62,7 @@ export const claimRateLimit: RateLimitOptions = {
   max: 10,
   timeWindow: "1 minute",
   keyGenerator: (request: FastifyRequest) => {
-    const authReq = request as any;
+    const authReq = request as AuthenticatedRequest;
     return authReq.authUser?.id ?? request.ip;
   },
   errorResponseBuilder,
@@ -62,6 +73,24 @@ export const claimRateLimit: RateLimitOptions = {
  * one request, so keep it tighter than ordinary API traffic.
  */
 export const batchMintRateLimit: RateLimitOptions = {
+  max: 5,
+  timeWindow: "1 minute",
+  keyGenerator: (request: FastifyRequest) => {
+    const authReq = request as AuthenticatedRequest;
+    return authReq.authUser?.id ?? request.ip;
+  },
+  errorResponseBuilder,
+};
+
+/**
+ * Batch quiz generation (#308) can fan out into up to MAX_BATCH_GENERATE_MODULES
+ * sequential AI service calls per request — each module's own per-module/hour
+ * counter (assertGenerationAllowed) already caps the underlying AI load, but
+ * this route-level limit additionally caps how often the batch endpoint
+ * itself can be hit, mirroring batchMintRateLimit's rationale for other
+ * multi-step endpoints.
+ */
+export const quizBatchGenerationRateLimit: RateLimitOptions = {
   max: 5,
   timeWindow: "1 minute",
   keyGenerator: (request: FastifyRequest) => {

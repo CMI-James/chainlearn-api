@@ -5,16 +5,44 @@ import {
   getNetworkPassphrase,
 } from "../config/stellar.js";
 import { logger } from "../utils/logger.js";
-import { StellarError } from "../utils/errors.js";
 import {
   stellarRetry,
   circuitBreakerExecute,
   withTimeout,
 } from "./resilience.js";
 import { getRequestId } from "../utils/request-context.js";
+import { getHorizonEnvelopeXdr, getHttpStatus, toStellarClientError } from "./errors.js";
 
 const READ_TIMEOUT_MS = 10_000;
 const WRITE_TIMEOUT_MS = 30_000;
+
+/**
+ * Read the ledger sequence number out of a Horizon transaction's `ledger`
+ * field.
+ *
+ * Horizon returns this as a plain number, but @stellar/stellar-sdk v13
+ * declares `TransactionRecord["ledger"]` as `CallFunction<LedgerRecord>`
+ * (a lazy-loader function) rather than the number it actually sends, so the
+ * declared type is unusable for arithmetic. Normalize through `unknown`
+ * rather than casting to `number`: that would silence the compiler while
+ * leaving a `() => Promise<...>` at runtime, and `latestLedger - NaN` is
+ * exactly the kind of silent corruption this function exists to prevent.
+ *
+ * Returns null for anything that isn't a usable sequence number, so callers
+ * degrade to "confirmations unknown" instead of reporting a wrong count.
+ */
+function toLedgerSequence(ledger: unknown): number | null {
+  if (typeof ledger === "number" && Number.isFinite(ledger)) return ledger;
+  if (
+    typeof ledger === "object" &&
+    ledger !== null &&
+    "sequence" in ledger &&
+    typeof (ledger as { sequence: unknown }).sequence === "number"
+  ) {
+    return (ledger as { sequence: number }).sequence;
+  }
+  return null;
+}
 
 /**
  * Core Stellar client wrapping Horizon + Soroban RPC interactions.
@@ -35,7 +63,8 @@ export class StellarClient {
   async getAccount(
     publicKey: string,
   ): Promise<StellarSdk.Horizon.AccountResponse> {
-    logger.debug({ requestId: getRequestId(), publicKey }, "Loading Stellar account");
+    const requestId = getRequestId();
+    logger.debug({ requestId, publicKey }, "Loading Stellar account");
     try {
       return await circuitBreakerExecute(
         () =>
@@ -45,8 +74,9 @@ export class StellarClient {
         "read"
       );
     } catch (err) {
-      logger.error({ err, publicKey }, "Failed to load Stellar account");
-      throw new StellarError(`Account ${publicKey} not found or unreachable`);
+      const clientError = toStellarClientError(err, `Account ${publicKey} not found or unreachable`);
+      logger.error({ requestId, err, publicKey, kind: clientError.kind }, "Failed to load Stellar account");
+      throw clientError;
     }
   }
 
@@ -67,19 +97,18 @@ export class StellarClient {
       );
       logger.info({ requestId, hash: result.hash }, "Transaction submitted successfully");
       return result;
-    } catch (err: any) {
-      const extras = err.response?.data?.extras;
-      if (extras) {
-        logger.error(
-          { resultCodes: extras.result_codes, envelope: extras.envelope_xdr },
-          "Transaction failed",
-        );
-      }
-      throw new StellarError(
-        extras?.result_codes
-          ? `Tx failed: ${JSON.stringify(extras.result_codes)}`
-          : "Transaction submission failed",
+    } catch (err) {
+      const clientError = toStellarClientError(err, "Transaction submission failed");
+      logger.error(
+        {
+          requestId,
+          resultCodes: clientError.resultCodes,
+          envelope: getHorizonEnvelopeXdr(err),
+          kind: clientError.kind,
+        },
+        "Transaction failed",
       );
+      throw clientError;
     }
   }
 
@@ -90,7 +119,8 @@ export class StellarClient {
   async callContract(
     tx: StellarSdk.Transaction,
   ): Promise<StellarSdk.rpc.Api.SimulateTransactionResponse> {
-    logger.debug({ requestId: getRequestId() }, "Simulating Stellar contract call");
+    const requestId = getRequestId();
+    logger.debug({ requestId }, "Simulating Stellar contract call");
     try {
       return await circuitBreakerExecute(() =>
         stellarRetry.execute(() =>
@@ -98,8 +128,9 @@ export class StellarClient {
         ),
       );
     } catch (err) {
-      logger.error({ err }, "Soroban contract call failed");
-      throw new StellarError("Contract call failed");
+      const clientError = toStellarClientError(err, "Contract call failed");
+      logger.error({ requestId, err, kind: clientError.kind }, "Soroban contract call failed");
+      throw clientError;
     }
   }
 
@@ -110,7 +141,8 @@ export class StellarClient {
    * silently misled into treating an unreachable network as a missing account.
    */
   async accountExists(publicKey: string): Promise<boolean> {
-    logger.debug({ requestId: getRequestId(), publicKey }, "Checking Stellar account");
+    const requestId = getRequestId();
+    logger.debug({ requestId, publicKey }, "Checking Stellar account");
     try {
       await circuitBreakerExecute(
         () =>
@@ -120,13 +152,11 @@ export class StellarClient {
         "read"
       );
       return true;
-    } catch (err: any) {
-      const status = err?.response?.status ?? err?.status;
-      if (status === 404) return false;
-      logger.error({ err, publicKey }, "accountExists check failed");
-      throw new StellarError(
-        `Could not verify account ${publicKey}: ${err?.message ?? err}`,
-      );
+    } catch (err) {
+      if (getHttpStatus(err) === 404) return false;
+      const clientError = toStellarClientError(err, `Could not verify account ${publicKey}`);
+      logger.error({ requestId, err, publicKey, kind: clientError.kind }, "accountExists check failed");
+      throw clientError;
     }
   }
 
@@ -143,7 +173,8 @@ export class StellarClient {
    * Used by the pending-reward reconciliation job (#207).
    */
   async getTransaction(txHash: string): Promise<{ status: "SUCCESS" | "FAILED" | "NOT_FOUND" }> {
-    logger.debug({ requestId: getRequestId(), txHash }, "Fetching Stellar transaction");
+    const requestId = getRequestId();
+    logger.debug({ requestId, txHash }, "Fetching Stellar transaction");
     try {
       const result = await withTimeout(
         this.soroban.getTransaction(txHash),
@@ -153,12 +184,67 @@ export class StellarClient {
         return { status: "SUCCESS" };
       }
       return { status: "FAILED" };
-    } catch (err: any) {
-      const status = err?.response?.status ?? err?.status;
-      if (status === 404) return { status: "NOT_FOUND" };
-      logger.error({ err, txHash }, "getTransaction failed");
-      throw new StellarError(`Could not fetch transaction ${txHash}`);
+    } catch (err) {
+      if (getHttpStatus(err) === 404) return { status: "NOT_FOUND" };
+      const clientError = toStellarClientError(err, `Could not fetch transaction ${txHash}`);
+      logger.error({ requestId, err, txHash, kind: clientError.kind }, "getTransaction failed");
+      throw clientError;
     }
+  }
+
+  /**
+   * Look up a submitted transaction on Horizon and report its on-chain
+   * verification status. Used by GET /api/v1/rewards/transactions so users
+   * can verify their reward transactions rather than trusting the stored
+   * tx hash alone.
+   *
+   * Ledger lookup (for confirmation count) is best-effort — if it fails the
+   * transaction's own confirmed/failed status is still returned with
+   * confirmations left null, rather than failing the whole verification.
+   */
+  async getHorizonTransaction(txHash: string): Promise<{
+    status: "confirmed" | "pending" | "failed";
+    ledger: number | null;
+    confirmations: number | null;
+  }> {
+    logger.debug({ requestId: getRequestId(), txHash }, "Verifying Stellar transaction on Horizon");
+    let tx: StellarSdk.Horizon.ServerApi.TransactionRecord;
+    try {
+      tx = await circuitBreakerExecute(
+        () =>
+          stellarRetry.execute(() =>
+            withTimeout(this.horizon.transactions().transaction(txHash).call(), READ_TIMEOUT_MS)
+          ),
+        "read"
+      );
+    } catch (err) {
+      if (getHttpStatus(err) === 404) {
+        return { status: "pending", ledger: null, confirmations: null };
+      }
+      logger.warn({ err, txHash }, "Horizon transaction lookup failed — reporting pending");
+      return { status: "pending", ledger: null, confirmations: null };
+    }
+
+    if (!tx.successful) {
+      return { status: "failed", ledger: toLedgerSequence(tx.ledger), confirmations: null };
+    }
+
+    let confirmations: number | null = null;
+    try {
+      const latestLedgers = await withTimeout(
+        this.horizon.ledgers().order("desc").limit(1).call(),
+        READ_TIMEOUT_MS
+      );
+      const latestSequence = toLedgerSequence(latestLedgers.records[0]?.sequence);
+      const txLedger = toLedgerSequence(tx.ledger);
+      if (latestSequence !== null && txLedger !== null) {
+        confirmations = Math.max(latestSequence - txLedger + 1, 0);
+      }
+    } catch (err) {
+      logger.warn({ err, txHash }, "Failed to fetch latest ledger for confirmation count");
+    }
+
+    return { status: "confirmed", ledger: toLedgerSequence(tx.ledger), confirmations };
   }
 
   /** Check Soroban RPC health by calling getLatestLedger. */
@@ -166,8 +252,8 @@ export class StellarClient {
     try {
       // Use a shorter timeout for health checks (3s) to fail fast if RPC is unreachable
       await withTimeout(this.soroban.getLatestLedger(), 3_000);
-    } catch (err: any) {
-      const message = err?.message || String(err);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       logger.warn({ message }, "Soroban RPC health check failed");
       throw err;
     }

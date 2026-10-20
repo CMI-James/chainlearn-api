@@ -1,5 +1,6 @@
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
 import { db } from "../../config/database.js";
+import crypto from "node:crypto";
 import {
   quizSubmissions,
   quizzes,
@@ -19,15 +20,14 @@ import { createQuizProof } from "../../stellar/signatures.js";
 import { isCircuitBreakerError } from "../../stellar/resilience.js";
 import { config } from "../../config/index.js";
 import { logger } from "../../utils/logger.js";
-import {
-  enqueueReward,
-  getQueuedRewardJobs,
-  estimateProcessingSeconds,
-} from "../../services/retry-queue.js";
+import { getRequestId } from "../../utils/request-context.js";
+import { enqueueReward, getQueuedRewardJobs, estimateProcessingSeconds } from "../../services/retry-queue.js";
+import { dispatchWebhook } from "../../services/webhook-dispatcher.js";
 import StellarSdk from "@stellar/stellar-sdk";
 import type {
   RewardClaimResult,
   RewardHistoryItem,
+  RewardTransaction,
   PendingRewardItem,
 } from "./reward.types.js";
 import { PASSING_PERCENTAGE } from "../quizzes/quiz.types.js";
@@ -43,10 +43,10 @@ import {
   cacheKey,
   cacheInvalidatePattern,
 } from "../../cache/index.js";
+import { NotFoundError, ValidationError } from "../../utils/errors.js";
+import { DeductCreditsDto } from './dto/deduct-credits.dto';
 
 const REWARD_AMOUNT = 10; // credits per passed quiz
-const PENDING_REWARDS_TTL_SECONDS = 10; // #327 — near-real-time
-const PENDING_CONFIRMATION_ETA_SECONDS = 300; // reconcile job runs every 5 min
 
 export async function selectSubmissionForUpdate(
   tx: Parameters<typeof db.transaction>[0] extends (arg: infer T) => any ? T : never,
@@ -76,13 +76,20 @@ async function handleBadSeqError(submissionId: string, stellarAddress: string): 
   try {
     const account = await stellarClient.getAccount(stellarAddress);
     accountSeq = account.sequence;
-  } catch {
-    // Intentionally swallow error: sequence fetch is for debugging only
-    // If Horizon is unavailable, we still want to mark the transaction as pending
+  } catch (err) {
+    // Intentionally swallow error: sequence fetch is for debugging only —
+    // if Horizon is unavailable, we still want to mark the transaction as
+    // pending. Logged at warn (not error) since this is a best-effort
+    // diagnostic lookup, not the failure itself — the bad_seq warning below
+    // still fires either way.
+    logger.debug(
+      { err, submissionId, stellarAddress },
+      "Could not fetch account sequence for bad_seq diagnostics — Horizon unavailable",
+    );
   }
   
   logger.warn(
-    { submissionId, accountSeq },
+    { requestId: getRequestId(), submissionId, accountSeq },
     "bad_seq after invoke — the tx might actually succeed on-chain"
   );
   return "pending_indexer_confirmation";
@@ -126,6 +133,10 @@ async function _executeStellarRewardClaim(claimData: RewardClaimData): Promise<s
     ) {
       return handleBadSeqError(claimData.submissionId, claimData.stellarAddress);
     }
+    logger.error(
+      { err, submissionId: claimData.submissionId, userId: claimData.userId },
+      "Stellar reward claim transaction failed",
+    );
     throw err;
   }
 }
@@ -220,6 +231,10 @@ export async function processRewardClaim(
     try {
       txHash = await _executeStellarRewardClaim(claimData);
     } catch (err: unknown) {
+      logger.error(
+        { err, submissionId, userId },
+        "Reward claim failed — marking submission as rewardFailed",
+      );
       await db
         .update(quizSubmissions)
         .set({ rewardPending: false, rewardFailed: true })
@@ -233,7 +248,6 @@ export async function processRewardClaim(
     if (result) {
       await cacheDel(cacheKey("user", "progress", userId));
       await cacheDel(cacheKey("user", "profile", userId));
-      await cacheDel(cacheKey("rewards", "pending", userId));
       await cacheInvalidatePattern(cacheKey("rewards", "history", userId, "*"));
       await cacheInvalidatePattern(cacheKey("user", "activity", userId, "*"));
     }
@@ -329,7 +343,7 @@ export class RewardService {
 
         if (isCircuitBreakerError(err)) {
           logger.warn(
-            { submissionId },
+            { requestId: getRequestId(), submissionId },
             "Stellar circuit breaker open — queuing reward for later",
           );
           await db
@@ -337,7 +351,6 @@ export class RewardService {
             .set({ rewardPending: false })
             .where(eq(quizSubmissions.id, submissionId));
           await enqueueReward({ submissionId, userId });
-          await cacheDel(cacheKey("rewards", "pending", userId));
           rewardClaimsTotal.inc({ status: "queued" });
           auditLog("reward.queued", {
             userId,
@@ -358,7 +371,7 @@ export class RewardService {
           .update(quizSubmissions)
           .set({ rewardPending: false, rewardFailed: true })
           .where(eq(quizSubmissions.id, submissionId));
-        logger.error({ err, submissionId }, "On-chain reward claim failed");
+        logger.error({ err, requestId: getRequestId(), submissionId }, "On-chain reward claim failed");
         throw new Error("Failed to process on-chain reward");
       }
 
@@ -380,7 +393,6 @@ export class RewardService {
 
         await cacheDel(cacheKey("user", "progress", userId));
         await cacheDel(cacheKey("user", "profile", userId));
-        await cacheDel(cacheKey("rewards", "pending", userId));
         await cacheInvalidatePattern(cacheKey("rewards", "history", userId, "*"));
 
         return {
@@ -407,7 +419,6 @@ export class RewardService {
 
       await cacheDel(cacheKey("user", "progress", userId));
       await cacheDel(cacheKey("user", "profile", userId));
-      await cacheDel(cacheKey("rewards", "pending", userId));
       await cacheInvalidatePattern(cacheKey("rewards", "history", userId, "*"));
       await cacheInvalidatePattern(cacheKey("user", "activity", userId, "*"));
 
@@ -419,6 +430,121 @@ export class RewardService {
         message: `Successfully claimed ${REWARD_AMOUNT} credits`,
       };
     });
+  }
+
+  /**
+   * The user's reward claims that haven't landed yet (#327) — claims sitting
+   * in the retry queue, plus claims whose Stellar transaction was submitted
+   * but left unconfirmed by a sequence error.
+   *
+   * Queued entries come first, ordered by the retry queue's own ordering, so
+   * the response reads as "here's what will happen, in what order".
+   *
+   * Cached for 10s: short enough that a claim moving from queued to claimed
+   * disappears from this list promptly, long enough that a client polling it
+   * while Stellar is down doesn't hammer the DB on every tick.
+   */
+  async getPendingRewards(userId: string): Promise<PendingRewardItem[]> {
+    const namespace = "rewards";
+    const cacheKeyString = cacheKey(namespace, "pending", userId);
+
+    const cached = await cacheGet<PendingRewardItem[]>(namespace, cacheKeyString);
+    if (cached) return cached;
+
+    // A job still in the queue but already marked claimed/pending in the DB
+    // would be double-reported (once as queued, once as awaiting
+    // confirmation) — the metadata query below only picks up submissions that
+    // are neither, so the two lists stay disjoint.
+    const pendingRows = await db
+      .select({
+        submissionId: quizSubmissions.id,
+        courseTitle: courses.title,
+        rewardAmount: quizSubmissions.rewardAmount,
+        txHash: quizSubmissions.txHash,
+        submittedAt: quizSubmissions.submittedAt,
+      })
+      .from(quizSubmissions)
+      .innerJoin(quizzes, eq(quizSubmissions.quizId, quizzes.id))
+      .innerJoin(courses, eq(quizzes.courseId, courses.id))
+      .where(
+        and(
+          eq(quizSubmissions.userId, userId),
+          eq(quizSubmissions.rewardPending, true),
+        ),
+      );
+
+    // The queue is a single global Redis sorted set shared by every user, so
+    // filter to this user's jobs and keep the queue's own ordering (already
+    // sorted by scheduled ready time) rather than re-sorting here.
+    const queuedJobs = (await getQueuedRewardJobs()).filter(
+      (job) => job.userId === userId,
+    );
+
+    let queuedItems: PendingRewardItem[] = [];
+    if (queuedJobs.length > 0) {
+      const metadataRows = await db
+        .select({
+          submissionId: quizSubmissions.id,
+          courseTitle: courses.title,
+          rewardAmount: quizSubmissions.rewardAmount,
+          submittedAt: quizSubmissions.submittedAt,
+        })
+        .from(quizSubmissions)
+        .innerJoin(quizzes, eq(quizSubmissions.quizId, quizzes.id))
+        .innerJoin(courses, eq(quizzes.courseId, courses.id))
+        .where(
+          and(
+            inArray(
+              quizSubmissions.id,
+              queuedJobs.map((job) => job.submissionId),
+            ),
+            eq(quizSubmissions.rewardClaimed, false),
+            eq(quizSubmissions.rewardPending, false),
+          ),
+        );
+
+      const bySubmissionId = new Map(
+        metadataRows.map((row) => [row.submissionId, row]),
+      );
+
+      queuedItems = queuedJobs.flatMap((job) => {
+        const row = bySubmissionId.get(job.submissionId);
+        if (!row) return [];
+        return [
+          {
+            submissionId: row.submissionId,
+            courseTitle: row.courseTitle,
+            amount: row.rewardAmount ?? REWARD_AMOUNT,
+            status: "queued" as const,
+            // 1-based: the queue's own `position` is 0-based, and "position 0"
+            // reads as a bug to a user looking at a queue position.
+            queuePosition: job.position + 1,
+            estimatedProcessingSeconds: estimateProcessingSeconds(
+              job.position,
+              job.readyAt,
+            ),
+            submittedAt: row.submittedAt,
+          },
+        ];
+      });
+    }
+
+    const result: PendingRewardItem[] = [
+      ...queuedItems,
+      ...pendingRows.map((row) => ({
+        submissionId: row.submissionId,
+        courseTitle: row.courseTitle,
+        amount: row.rewardAmount ?? REWARD_AMOUNT,
+        status: "awaiting_confirmation" as const,
+        queuePosition: null,
+        estimatedProcessingSeconds: null,
+        submittedAt: row.submittedAt,
+      })),
+    ];
+
+    await cacheSet(cacheKeyString, result, 10);
+
+    return result;
   }
 
   /**
@@ -488,123 +614,151 @@ export class RewardService {
   }
 
   /**
-   * The authenticated user's reward claims that haven't landed yet (#327):
-   * claims sitting in the retry queue because Stellar was unavailable, and
-   * claims whose on-chain transaction is submitted but unconfirmed after a
-   * sequence error. Gives users visibility into a state that was previously
-   * invisible. Cached for 10s only — this is near-real-time data.
+   * Get all reward-related blockchain transactions for a user, each
+   * verified against Stellar Horizon so the caller doesn't have to trust
+   * the stored tx hash blindly. Paginated and cached for 30s — verification
+   * involves a live Horizon call per transaction, so a short cache keeps
+   * repeated page loads cheap without going stale for long.
    */
-  async getPendingRewards(userId: string): Promise<PendingRewardItem[]> {
+  async getTransactions(
+    userId: string,
+    page: number,
+    limit: number,
+  ): Promise<{ transactions: RewardTransaction[]; total: number }> {
     const namespace = "rewards";
-    const cacheKeyString = cacheKey(namespace, "pending", userId);
+    const cacheKeyString = cacheKey(namespace, "transactions", userId, page, limit);
 
-    const cached = await cacheGet<PendingRewardItem[]>(
+    const cached = await cacheGet<{ transactions: RewardTransaction[]; total: number }>(
       namespace,
       cacheKeyString,
     );
     if (cached) return cached;
 
-    // Queued claims — pull this user's jobs out of the Redis retry queue.
-    const queuedJobs = (await getQueuedRewardJobs()).filter(
-      (job) => job.userId === userId,
+    const offset = (page - 1) * limit;
+    const where = and(
+      eq(quizSubmissions.userId, userId),
+      sql`${quizSubmissions.txHash} IS NOT NULL`,
     );
 
-    // Awaiting-confirmation claims — rewardPending rows in the database.
-    const pendingRows = await db
+    const [totalResult] = await db
+      .select({ value: sql<number>`count(*)`.mapWith(Number) })
+      .from(quizSubmissions)
+      .where(where);
+
+    const rows = await db
       .select({
-        submissionId: quizSubmissions.id,
-        courseTitle: courses.title,
-        rewardAmount: quizSubmissions.rewardAmount,
+        id: quizSubmissions.id,
         txHash: quizSubmissions.txHash,
+        rewardAmount: quizSubmissions.rewardAmount,
         submittedAt: quizSubmissions.submittedAt,
+        courseTitle: courses.title,
       })
       .from(quizSubmissions)
       .innerJoin(quizzes, eq(quizSubmissions.quizId, quizzes.id))
       .innerJoin(courses, eq(quizzes.courseId, courses.id))
-      .where(
-        and(
-          eq(quizSubmissions.userId, userId),
-          eq(quizSubmissions.rewardPending, true),
-        ),
-      );
+      .where(where)
+      .orderBy(desc(quizSubmissions.submittedAt))
+      .limit(limit)
+      .offset(offset);
 
-    // Course titles for queued jobs (their submissions aren't rewardPending).
-    const queuedSubmissionIds = queuedJobs.map((j) => j.submissionId);
-    const queuedMeta = new Map<
-      string,
-      { courseTitle: string; rewardAmount: number | null; submittedAt: Date }
-    >();
-    if (queuedSubmissionIds.length > 0) {
-      const rows = await db
-        .select({
-          submissionId: quizSubmissions.id,
-          courseTitle: courses.title,
-          rewardAmount: quizSubmissions.rewardAmount,
-          submittedAt: quizSubmissions.submittedAt,
-        })
-        .from(quizSubmissions)
-        .innerJoin(quizzes, eq(quizSubmissions.quizId, quizzes.id))
-        .innerJoin(courses, eq(quizzes.courseId, courses.id))
-        .where(inArray(quizSubmissions.id, queuedSubmissionIds));
-      for (const row of rows) {
-        queuedMeta.set(row.submissionId, {
+    const transactions: RewardTransaction[] = await Promise.all(
+      rows.map(async (row) => {
+        const txHash = row.txHash as string;
+
+        // A bad_seq retry marks the tx as pending indexer confirmation
+        // rather than a real hash — nothing to look up on Horizon yet.
+        if (txHash === "pending_indexer_confirmation") {
+          return {
+            id: row.id,
+            courseTitle: row.courseTitle,
+            amount: row.rewardAmount ?? REWARD_AMOUNT,
+            txHash,
+            status: "pending" as const,
+            blockHeight: null,
+            confirmationCount: null,
+            submittedAt: row.submittedAt,
+          };
+        }
+
+        const verification = await stellarClient.getHorizonTransaction(txHash);
+        return {
+          id: row.id,
           courseTitle: row.courseTitle,
-          rewardAmount: row.rewardAmount,
+          amount: row.rewardAmount ?? REWARD_AMOUNT,
+          txHash,
+          status: verification.status,
+          blockHeight: verification.ledger,
+          confirmationCount: verification.confirmations,
           submittedAt: row.submittedAt,
+        };
+      }),
+    );
+
+    const result = { transactions, total: totalResult?.value ?? 0 };
+    await cacheSet(cacheKeyString, result, 30);
+
+    return result;
+  }
+
+  /**
+   * Get the top earners by total credits (leaderboard).
+   * Excludes users with 0 credits, cached for 5 minutes.
+   * Returns top 50 by default, max 50.
+   */
+  async getLeaderboard(
+    limit: number = 50,
+  ): Promise<{ rank: number; displayName: string; credits: number }[]> {
+    const namespace = "rewards";
+    const cacheKeyString = cacheKey(namespace, "leaderboard", limit);
+
+    const cached = await cacheGet<
+      { rank: number; displayName: string; credits: number }[]
+    >(namespace, cacheKeyString);
+    if (cached) return cached;
+
+    // Query users with credits > 0, ordered by credits descending
+    const rows = await db
+      .select({
+        displayName: users.displayName,
+        credits: users.credits,
+      })
+      .from(users)
+      .where(sql`${users.credits} > 0`)
+      .orderBy(desc(users.credits), desc(users.createdAt))
+      .limit(limit);
+
+    // Add rank to each entry
+    const leaderboard = rows.map((row, index) => ({
+      rank: index + 1,
+      displayName: row.displayName ?? "Anonymous",
+      credits: row.credits,
+    }));
+
+    await cacheSet(cacheKeyString, leaderboard, 300); // 5 minute TTL
+
+    return leaderboard;
+  }
+  async deductCredits(adminId: string, userId: string, dto: DeductCreditsDto) {
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Fetch user to verify existence and current balance
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { id: true, credits: true },
+      });
+
+      if (!user) {
+        throw new NotFoundError(`User with ID ${userId} not found`);
+      }
+
+      // 2. Validate that amount does not exceed user's balance
+      if (user.credits < dto.amount) {
+        throw new ValidationError({
+          amount: [`Insufficient credits. User balance (${user.credits}) is less than requested deduction amount (${dto.amount}).`],
         });
       }
-    }
-
-    const items: PendingRewardItem[] = [];
-    const seen = new Set<string>();
-
-    for (const job of queuedJobs) {
-      const meta = queuedMeta.get(job.submissionId);
-      if (!meta) continue; // submission deleted — skip a dangling queue entry
-      seen.add(job.submissionId);
-      items.push({
-        submissionId: job.submissionId,
-        courseTitle: meta.courseTitle,
-        amount: meta.rewardAmount ?? REWARD_AMOUNT,
-        status: "queued",
-        queuePosition: job.position + 1,
-        estimatedProcessingSeconds: estimateProcessingSeconds(
-          job.position,
-          job.readyAt,
-        ),
-        txHash: null,
-        submittedAt: meta.submittedAt,
-      });
-    }
-
-    for (const row of pendingRows) {
-      if (seen.has(row.submissionId)) continue;
-      seen.add(row.submissionId);
-      items.push({
-        submissionId: row.submissionId,
-        courseTitle: row.courseTitle,
-        amount: row.rewardAmount ?? REWARD_AMOUNT,
-        status: "awaiting_confirmation",
-        queuePosition: null,
-        // The reconciliation job runs every 5 minutes (#207).
-        estimatedProcessingSeconds: PENDING_CONFIRMATION_ETA_SECONDS,
-        txHash: row.txHash,
-        submittedAt: row.submittedAt,
-      });
-    }
-
-    items.sort((a, b) => {
-      if (a.status !== b.status) return a.status === "queued" ? -1 : 1;
-      if (a.status === "queued") {
-        return (a.queuePosition ?? 0) - (b.queuePosition ?? 0);
-      }
-      return a.submittedAt.getTime() - b.submittedAt.getTime();
     });
-
-    await cacheSet(cacheKeyString, items, PENDING_REWARDS_TTL_SECONDS);
-
-    return items;
   }
 }
+
 
 export const rewardService = new RewardService();

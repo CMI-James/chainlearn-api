@@ -2,7 +2,6 @@ import { initTracing, shutdownTracing } from "./tracing.js";
 
 import { createReadStream } from "node:fs";
 import { access } from "node:fs/promises";
-import path from "node:path";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
@@ -12,13 +11,14 @@ import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { sql } from "drizzle-orm";
-import { config } from "./config/index.js";
+import { config, corsOrigins } from "./config/index.js";
 import { logger } from "./utils/logger.js";
 import { registry, setupInfraMetrics } from "./metrics/index.js";
 import { registerMetricsHook } from "./metrics/fastify-hook.js";
 import { registerErrorHandler } from "./middleware/error-handler.js";
 import { registerRequestTimeout } from "./middleware/timeout.js";
 import { rateLimitOptions } from "./middleware/rate-limit.js";
+import { listBlockedIps, clearIpBlock } from "./middleware/auth-brute-force.js";
 import { authGuard } from "./middleware/auth.js";
 import { db } from "./config/database.js";
 import { redis } from "./config/redis.js";
@@ -41,9 +41,15 @@ import {
   startReconciliationJob,
   stopReconciliationJob,
 } from "./jobs/reconcile-pending-rewards.js";
+import {
+  startWebhookRetryProcessor,
+  stopWebhookRetryProcessor,
+} from "./jobs/process-webhook-retries.js";
 import { processRewardClaim } from "./modules/rewards/reward.service.js";
 import { warmCourseCache } from "./cache/warmer.js";
 import { runWithRequestContext } from "./utils/request-context.js";
+import { resolveSafeStaticPath } from "./utils/safe-static-path.js";
+import { checkServiceHealth } from "./utils/service-health.js";
 
 // Versioned route modules
 import { registerVersionedRoutes } from "./routes/versioning.js";
@@ -168,21 +174,67 @@ async function buildApp() {
   // CSRF-safe (cross-site requests can't set custom headers). `credentials:
   // true` only matters if auth ever moves to cookies — if it does, add a CSRF
   // token (e.g. @fastify/csrf-protection) and restrict the origin list.
+  //
+  // `corsOrigins` comes from config: CORS_ORIGINS (comma-separated) when set,
+  // otherwise the per-environment default (chainlearn.io in production,
+  // localhost:3000 elsewhere) — see src/config/index.ts.
   await app.register(cors, {
-    origin:
-      config.NODE_ENV === "production"
-        ? ["https://chainlearn.io"]
-        : ["http://localhost:3000"],
+    origin: corsOrigins,
     credentials: true,
+    hook: "onRequest",
   });
 
+  app.addHook("onRequest", (request, _reply, done) => {
+    const origin = request.headers.origin;
+    if (origin) {
+      logger.debug(
+        { origin, allowed: corsOrigins.includes(origin) },
+        "CORS request"
+      );
+    }
+    done();
+  });
+
+  const previousSecrets = config.JWT_SECRET_PREVIOUS ?? [];
   await app.register(jwt, {
     secret: config.JWT_SECRET,
     sign: { expiresIn: "24h" },
   });
 
+  // Support key rotation: verify tokens against previous secrets when the
+  // current secret fails. New tokens are always signed with the latest secret.
+  if (previousSecrets.length > 0) {
+    const originalVerify = app.jwt.verify.bind(app.jwt);
+    app.jwt.verify = function (token: string, ...args: any[]) {
+      try {
+        return originalVerify(token, ...args);
+      } catch (err) {
+        for (const prevSecret of previousSecrets) {
+          try {
+            return originalVerify(token, { secret: prevSecret }, ...args.slice(1));
+          } catch {
+            // try next
+          }
+        }
+        throw err;
+      }
+    };
+  }
+
   await app.register(rateLimit, rateLimitOptions());
 
+  // ─── CSRF Protection ───────────────────────────────────────────────────
+  // Auth uses Bearer tokens (Authorization header), which are CSRF-safe.
+  // credentials: true in CORS only matters if auth moves to cookies.
+  // If cookie-based auth is added, enable @fastify/csrf-protection here:
+  //
+  //   import csrf from "@fastify/csrf-protection";
+  //   await app.register(csrf, {
+  //     sessionPlugin: "@fastify/cookie",
+  //     csrfOpts: { ignoreMethods: ["GET", "HEAD", "OPTIONS"] },
+  //   });
+  //
+  // Until then, no CSRF token generation or validation is needed.
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_BODY_LIMIT_BYTES,
@@ -214,12 +266,8 @@ async function buildApp() {
       (c) => c.status === "fulfilled",
     );
 
-    const status = allHealthy ? "healthy" : "degraded";
-
     return reply.status(allHealthy ? 200 : 503).send({
-      status,
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
+      status: allHealthy ? "ready" : "not_ready",
       checks: {
         database: dbCheck.status === "fulfilled" ? "ok" : "error",
         redis: redisCheck.status === "fulfilled" ? "ok" : "error",
@@ -227,6 +275,43 @@ async function buildApp() {
         soroban: sorobanCheck.status === "fulfilled" ? "ok" : "error",
       },
     });
+  });
+
+  // Individual per-service health checks (#483) — the combined /health above
+  // can't tell an operator which dependency is down. Each of these is
+  // independent so one outage doesn't block checking the others, and none
+  // require authentication (matching /health).
+  app.get("/health/redis", async (_request, reply) => {
+    const result = await checkServiceHealth("redis", () => redis.ping());
+    return reply.status(result.status === "ok" ? 200 : 503).send(result);
+  });
+
+  app.get("/health/database", async (_request, reply) => {
+    const result = await checkServiceHealth("database", () => db.execute(sql`SELECT 1`));
+    return reply.status(result.status === "ok" ? 200 : 503).send(result);
+  });
+
+  app.get("/health/stellar", async (_request, reply) => {
+    const [horizon, soroban] = await Promise.all([
+      checkServiceHealth("stellar.horizon", () => stellarClient.getHorizonServer().root()),
+      checkServiceHealth("stellar.soroban", () => stellarClient.checkSorobanHealth()),
+    ]);
+    const status = horizon.status === "ok" && soroban.status === "ok" ? "ok" : "down";
+    return reply.status(status === "ok" ? 200 : 503).send({
+      status,
+      latencyMs: Math.max(horizon.latencyMs, soroban.latencyMs),
+      checks: { horizon, soroban },
+    });
+  });
+
+  app.get("/health/ai", async (_request, reply) => {
+    const result = await checkServiceHealth("ai", async () => {
+      const response = await fetch(`${config.AI_SERVICE_URL}/health`);
+      if (!response.ok) {
+        throw new Error(`AI service health check returned ${response.status}`);
+      }
+    });
+    return reply.status(result.status === "ok" ? 200 : 503).send(result);
   });
 
   app.get("/metrics", { preHandler: authGuard }, async (_request, reply) => {
@@ -240,7 +325,17 @@ async function buildApp() {
     "/uploads/avatars/:filename",
     async (request, reply) => {
       const { filename } = request.params;
-      if (!/^[A-Za-z0-9_-]+\\.(jpg|png|webp)$/.test(filename)) {
+      // #486: previously `\\.` in this regex literal matched a literal
+      // backslash character, not an escaped dot, so this route 404'd on
+      // every legitimate filename. Fixed to `\.`, and path resolution is
+      // now handled by resolveSafeStaticPath (basename + within-directory
+      // check) rather than a bare path.join of the raw param.
+      const filePath = resolveSafeStaticPath(
+        filename,
+        config.AVATAR_UPLOAD_DIR,
+        /^[A-Za-z0-9_-]+\.(jpg|png|webp)$/,
+      );
+      if (!filePath) {
         return reply.status(404).send({
           statusCode: 404,
           error: "NOT_FOUND",
@@ -248,7 +343,6 @@ async function buildApp() {
         });
       }
 
-      const filePath = path.join(path.resolve(config.AVATAR_UPLOAD_DIR), filename);
       try {
         await access(filePath);
       } catch {
@@ -284,7 +378,9 @@ async function buildApp() {
     );
 
     return reply.status(allHealthy ? 200 : 503).send({
-      status: allHealthy ? "ready" : "not_ready",
+      status: allHealthy ? "healthy" : "degraded",
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
       checks: {
         database: dbCheck.status === "fulfilled" ? "ok" : "error",
         redis: redisCheck.status === "fulfilled" ? "ok" : "error",
@@ -293,6 +389,20 @@ async function buildApp() {
       },
     });
   });
+
+  // ─── Admin: Auth IP Blocks ─────────────────────────────────────────────
+  app.get("/admin/auth-blocks", async (_request, reply) => {
+    const blocks = await listBlockedIps();
+    reply.send({ blocks });
+  });
+
+  app.delete<{ Params: { ip: string } }>(
+    "/admin/auth-blocks/:ip",
+    async (request, reply) => {
+      const cleared = await clearIpBlock(request.params.ip);
+      reply.send({ cleared });
+    }
+  );
 
   // ─── API Routes ─────────────────────────────────────────────────────────
   await registerVersionedRoutes(app);
@@ -307,6 +417,7 @@ async function start() {
   startIdempotencyCleanup();
   startNotificationCleanup();
   startReconciliationJob();
+  startWebhookRetryProcessor();
   // Re-enqueue any reward claims dropped during a Redis restart (#208).
   recoverLostJobs().catch((err) => logger.error({ err }, "recoverLostJobs startup failed"));
 
@@ -344,6 +455,7 @@ async function start() {
     stopIdempotencyCleanup();
     stopNotificationCleanup();
     stopReconciliationJob();
+    stopWebhookRetryProcessor();
     if (cacheWarmInterval) {
       clearInterval(cacheWarmInterval);
     }

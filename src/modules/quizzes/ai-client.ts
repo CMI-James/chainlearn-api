@@ -9,6 +9,8 @@ const aiQuizQuestionSchema = z.object({
   prompt: z.string(),
   options: z.array(z.string()),
   correct_index: z.number().int(),
+  correct_feedback: z.string().optional(),
+  incorrect_feedback: z.string().optional(),
 });
 
 const aiQuizResponseSchema = z.object({
@@ -58,7 +60,7 @@ async function requestQuiz(
 
     if (!response.ok) {
       logger.error(
-        { status: response.status },
+        { requestId, status: response.status },
         "AI service quiz generation failed"
       );
       throw new Error(`AI service returned ${response.status}`);
@@ -68,7 +70,7 @@ async function requestQuiz(
     const parsed = aiQuizResponseSchema.safeParse(raw);
     if (!parsed.success) {
       logger.error(
-        { issues: parsed.error.issues },
+        { requestId, issues: parsed.error.issues },
         "AI service returned a malformed response"
       );
       throw new Error("AI service returned a malformed response");
@@ -77,7 +79,7 @@ async function requestQuiz(
     return parsed.data.questions;
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
-      logger.error({ timeout: config.AI_TIMEOUT_MS }, "AI service request timed out");
+      logger.error({ requestId: getRequestId(), timeout: config.AI_TIMEOUT_MS }, "AI service request timed out");
       throw new Error(`AI service request timed out after ${config.AI_TIMEOUT_MS}ms`);
     }
     throw err;

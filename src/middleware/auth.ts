@@ -5,6 +5,8 @@ import { users } from "../database/schema.js";
 import { eq } from "drizzle-orm";
 import { logger } from "../utils/logger.js";
 import { redis } from "../config/redis.js";
+import { sessionService } from "../modules/auth/session.service.js";
+import { safeEqual } from "../utils/crypto.js";
 
 const JWT_DENYLIST_PREFIX = "jwt:revoked:";
 
@@ -46,7 +48,8 @@ export async function authGuard(
       stellarAddress: string;
       jti?: string;
     }>();
-  } catch {
+  } catch (err) {
+    logger.debug({ err }, "JWT verification failed");
     throw new UnauthorizedError("Invalid or expired token");
   }
 
@@ -79,17 +82,24 @@ export async function authGuard(
 
     // Validate that the stellarAddress in the JWT matches the database record
     // This provides defense-in-depth against token forgery scenarios
-    if (decoded.stellarAddress !== user.stellarAddress) {
+    if (!safeEqual(decoded.stellarAddress, user.stellarAddress)) {
       throw new UnauthorizedError("Token stellarAddress mismatch");
     }
 
     (request as AuthenticatedRequest).authUser = {
       id: user.id,
       stellarAddress: user.stellarAddress,
+      isAdmin: user.isAdmin ?? false,
     };
+
+    if (decoded.jti) {
+      const deviceInfo = request.headers["user-agent"] ?? null;
+      await sessionService.track(user.id, decoded.jti, deviceInfo, request.ip ?? null);
+    }
   } catch (err) {
     if (err instanceof UnauthorizedError) throw err;
-    throw new UnauthorizedError("Invalid or expired token");
+    logger.error({ err }, "Auth guard infrastructure error");
+    throw err;
   }
 }
 
@@ -110,9 +120,8 @@ export async function optionalAuth(
 
 /**
  * Restricts a route to admin users. Must run after authGuard — it reads
- * `request.authUser` set by it and re-fetches the user's isAdmin flag
- * (not carried on the JWT/AuthUser, so it always reflects the current
- * database state rather than a stale claim from token-issue time).
+ * `request.authUser.isAdmin` which authGuard already fetched from the DB,
+ * so no second round-trip is needed (#537).
  */
 export async function adminGuard(
   request: FastifyRequest,
@@ -120,11 +129,7 @@ export async function adminGuard(
 ): Promise<void> {
   const { authUser } = request as AuthenticatedRequest;
 
-  const user = await db.query.users.findFirst({
-    where: eq(users.id, authUser.id),
-  });
-
-  if (!user?.isAdmin) {
+  if (!authUser.isAdmin) {
     throw new ForbiddenError("Admin access required");
   }
 }
@@ -132,6 +137,7 @@ export async function adminGuard(
 export interface AuthUser {
   id: string;
   stellarAddress: string;
+  isAdmin: boolean;
 }
 
 export interface AuthenticatedRequest extends FastifyRequest {
