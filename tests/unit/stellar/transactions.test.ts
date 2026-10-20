@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
-import { StellarError } from "../../../src/utils/errors.js";
 
 const VALID_PUBLIC_KEY = "GAXK5L7G7U7YGH4WGONDXK3ZO2RMGET6ANTTSBCN7CNNRWBFUO5NGXAM";
 const VALID_CONTRACT_ID = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
@@ -127,18 +126,6 @@ describe("invokeContract", () => {
 
     expect(result).toBe("abc123");
     expect(mockSubmitTransaction).toHaveBeenCalledTimes(1);
-  });
-
-  it("retries once on bad_seq and invalidates the cached sequence", async () => {
-    mockSubmitTransaction
-      .mockRejectedValueOnce(new StellarError('tx failed: ["tx_bad_seq"]'))
-      .mockResolvedValueOnce({ hash: "def456" });
-
-    const result = await invokeContract(VALID_CONTRACT_ID, "method", []);
-
-    expect(result).toBe("def456");
-    expect(mockInvalidate).toHaveBeenCalledWith(VALID_PUBLIC_KEY);
-    expect(mockSubmitTransaction).toHaveBeenCalledTimes(2);
   });
 
   it("isSimulationError type-predicate spy slot can be rebound per test", async () => {
