@@ -55,33 +55,6 @@ export class AuthController {
   ): Promise<void> {
     const { stellarAddress, challengeId, signedChallenge } = request.body;
 
-    try {
-      const authResult = await authService.verifyChallenge(
-        stellarAddress,
-        signedChallenge
-      );
-
-      await clearAuthFailures(request);
-
-      const token = request.server.jwt.sign(
-        {
-          sub: authResult.user.id,
-          stellarAddress: authResult.user.stellarAddress,
-        },
-        { expiresIn: "24h" }
-      );
-
-      reply.send({
-        success: true,
-        data: {
-          token,
-          user: authResult.user,
-        },
-      });
-    } catch (err) {
-      await recordAuthFailure(request);
-      throw err;
-    }
     let authResult;
     try {
       authResult = await authService.verifyChallenge(

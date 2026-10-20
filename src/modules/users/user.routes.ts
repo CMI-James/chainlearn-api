@@ -205,6 +205,18 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
     (request, reply) => notificationController.list(request, reply)
   );
 
+  app.put(
+    "/me/notifications/read-all",
+    {
+      schema: {
+        description: "Mark all unread notifications as read for the authenticated user",
+        tags: ["users", "notifications"],
+        security: [{ bearerAuth: [] }],
+      } as FastifySchema,
+    },
+    (request, reply) => notificationController.markAllRead(request, reply)
+  );
+
   app.put<{ Params: { id: string } }>(
     "/me/notifications/:id/read",
     {

@@ -39,7 +39,6 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     {
       preHandler: [checkIpBlock, validate({ body: verifySchema })],
       config: { rateLimit: authRateLimit },
-      preHandler: [validate({ body: verifySchema })],
       schema: {
         description: "Verify signed challenge and get JWT",
         tags: ["auth"],

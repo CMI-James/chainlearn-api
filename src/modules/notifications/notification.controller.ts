@@ -31,6 +31,19 @@ export class NotificationController {
   }
 
   /**
+   * PUT /api/v1/users/me/notifications/read-all
+   * Mark all of the authenticated user's unread notifications as read (#562).
+   */
+  async markAllRead(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const { authUser } = request as AuthenticatedRequest;
+    const result = await notificationService.markAllRead(authUser.id);
+    reply.send({ success: true, data: result });
+  }
+
+  /**
    * PUT /api/v1/users/me/notifications/:id/read
    * Mark a single notification as read.
    */
