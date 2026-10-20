@@ -1,4 +1,5 @@
 import { and, count, desc, eq } from "drizzle-orm";
+import { z } from "zod";
 import { db } from "../../config/database.js";
 import { notifications } from "../../database/schema.js";
 import { NotFoundError } from "../../utils/errors.js";
@@ -7,6 +8,13 @@ import type {
   NotificationItem,
   NotificationsPage,
 } from "./notification.types.js";
+
+const createNotificationSchema = z.object({
+  userId: z.string().min(1),
+  type: z.string().min(1),
+  title: z.string().min(1).max(255),
+  message: z.string().min(1).max(5000),
+});
 
 export class NotificationService {
   private toItem(row: typeof notifications.$inferSelect): NotificationItem {
@@ -88,13 +96,14 @@ export class NotificationService {
     title: string;
     message: string;
   }): Promise<NotificationItem> {
+    const validated = createNotificationSchema.parse(data);
     const [created] = await db
       .insert(notifications)
       .values({
-        userId: data.userId,
-        type: data.type,
-        title: data.title,
-        message: data.message,
+        userId: validated.userId,
+        type: validated.type,
+        title: validated.title,
+        message: validated.message,
         read: false,
       })
       .returning();
