@@ -24,6 +24,7 @@ import {
 import { withLock } from "../../utils/lock.js";
 import { invokeContract } from "../../stellar/transactions.js";
 import { createMintAuthorization } from "../../stellar/signatures.js";
+import { getPlatformKeypair } from "../../config/stellar.js";
 import { config } from "../../config/index.js";
 import { logger } from "../../utils/logger.js";
 import { getRequestId } from "../../utils/request-context.js";
@@ -194,7 +195,7 @@ export class CredentialService {
           courseId,
           score: mintData.score,
           nftAssetCode: mintData.nftAssetCode,
-          nftIssuer: mintData.stellarAddress,
+          nftIssuer: getPlatformKeypair().publicKey(),
           mintTxHash: txHash,
         })
         .returning();
@@ -219,7 +220,7 @@ export class CredentialService {
       return {
         credentialId: credential.id,
         nftAssetCode: mintData.nftAssetCode,
-        nftIssuer: mintData.stellarAddress,
+        nftIssuer: getPlatformKeypair().publicKey(),
         mintTxHash: txHash,
         message: "Course completion credential minted successfully",
       };
