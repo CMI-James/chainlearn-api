@@ -678,10 +678,29 @@ export class CourseService {
    */
   async dropEnrollment(userId: string, courseId: string): Promise<void> {
     await withLock(`enroll:${userId}:${courseId}`, async () => {
+      const [existing] = await db
+        .select({ completedAt: enrollments.completedAt })
+        .from(enrollments)
+        .where(
+          and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId)),
+        );
+
+      if (!existing) {
+        throw new NotFoundError("Enrollment");
+      }
+
+      if (existing.completedAt) {
+        throw new ConflictError("Cannot drop a completed course");
+      }
+
       const [deleted] = await db
         .delete(enrollments)
         .where(
-          and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId)),
+          and(
+            eq(enrollments.userId, userId),
+            eq(enrollments.courseId, courseId),
+            isNull(enrollments.completedAt),
+          ),
         )
         .returning();
 

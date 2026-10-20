@@ -210,10 +210,8 @@ export class BadgeService {
     const completedCourseCount = completedCourseRow?.value ?? 0;
     const quizCompletionCount = quizRow?.value ?? 0;
     const credentialCount = credentialRow?.value ?? 0;
-    const streakCount = Math.max(
-      completedCourseCount > 0 || quizCompletionCount > 0 ? 1 : 0,
-      1,
-    );
+    const streakCount =
+      completedCourseCount > 0 || quizCompletionCount > 0 ? 1 : 0;
 
     // 3. Fetch all badge definitions
     const allBadges = await db.select().from(badges);
@@ -334,10 +332,8 @@ export class BadgeService {
     const completedCourseCount = completedCourseRow?.value ?? 0;
     const quizCompletionCount = quizRow?.value ?? 0;
     const credentialCount = credentialRow?.value ?? 0;
-    const streakCount = Math.max(
-      completedCourseCount > 0 || quizCompletionCount > 0 ? 1 : 0,
-      1,
-    );
+    const streakCount =
+      completedCourseCount > 0 || quizCompletionCount > 0 ? 1 : 0;
 
     const [allBadges, earnedRecords] = await Promise.all([
       db.select().from(badges).orderBy(asc(badges.createdAt)),
