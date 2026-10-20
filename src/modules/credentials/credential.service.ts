@@ -544,6 +544,7 @@ export class CredentialService {
 }
 
 export const credentialService = new CredentialService();
+export const credentialService = new CredentialService();
 
 
 
