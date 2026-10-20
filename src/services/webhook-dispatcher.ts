@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { eq, and, lte, isNull } from "drizzle-orm";
+import { eq, and, lte, isNull, sql } from "drizzle-orm";
 import { db } from "../config/database.js";
 import { webhooks, webhookAttempts } from "../database/schema.js";
 import { logger } from "../utils/logger.js";
@@ -115,15 +115,18 @@ async function sendWebhook(
 export async function dispatchWebhook(
   payload: WebhookPayload
 ): Promise<void> {
-  // Find all active webhooks listening for this event
-  const activeWebhooks = await db
+  // Fetch only webhooks that are active AND subscribe to this event.
+  // The JSONB @> operator pushes the event-type filter into the database so
+  // we never load webhooks for unrelated events (#531).
+  const listenersForEvent = await db
     .select()
     .from(webhooks)
-    .where(eq(webhooks.active, true));
-
-  const listenersForEvent = activeWebhooks.filter((w) =>
-    (w.events as string[]).includes(payload.event)
-  );
+    .where(
+      and(
+        eq(webhooks.active, true),
+        sql`${webhooks.events} @> ${JSON.stringify([payload.event])}::jsonb`
+      )
+    );
 
   if (listenersForEvent.length === 0) {
     logger.debug(
