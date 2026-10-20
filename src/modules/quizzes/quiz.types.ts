@@ -54,7 +54,7 @@ export const submitQuizSchema = z.object({
       z.object({
         questionId: z.string().min(1).max(100),
         // Bound the index so out-of-range values can't be submitted.
-        selectedIndex: z.number().int().min(0).max(20),
+        selectedIndex: z.number().int().min(0).max(MAX_QUIZ_OPTIONS - 1),
       })
     )
     .min(1, "At least one answer is required")
