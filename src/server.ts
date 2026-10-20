@@ -465,7 +465,6 @@ async function start() {
       clearInterval(cacheWarmInterval);
     }
     await app.close();
-    await stopAuditLogger();
     await closeDatabase();
     await closeRedis();
     await shutdownTracing();
