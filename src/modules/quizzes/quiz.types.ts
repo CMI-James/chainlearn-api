@@ -24,6 +24,13 @@ export const MAX_RETRIES_PER_MODULE_PER_DAY = 3;
 // calls).
 export const MAX_QUIZ_GENERATIONS_PER_MODULE_PER_HOUR = 5;
 
+/** Smallest workable number of choices for a multiple-choice question. */
+export const MIN_QUIZ_OPTIONS = 2;
+/** Upper bound on choices per question. Capped well below
+ *  submitQuizSchema's static max(20) so a hand-authored question can never
+ *  exceed what a submitted answer index can address. */
+export const MAX_QUIZ_OPTIONS = 10;
+
 // ─── Request Schemas ────────────────────────────────────────────────────────
 
 export const generateQuizSchema = z.object({
@@ -82,13 +89,6 @@ export const quizFeedbackSummaryQuerySchema = z.object({
 });
 
 // ─── Admin: Manual Quiz Authoring (#388) ─────────────────────────────────────
-
-/** Smallest workable number of choices for a multiple-choice question. */
-export const MIN_QUIZ_OPTIONS = 2;
-/** Upper bound on choices per question. Capped well below
- *  submitQuizSchema's static max(20) so a hand-authored question can never
- *  exceed what a submitted answer index can address. */
-export const MAX_QUIZ_OPTIONS = 10;
 
 /**
  * One hand-authored question (#388). Matches the shape QuizService stores

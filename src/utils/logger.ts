@@ -7,6 +7,8 @@ import { getRequestId } from "./request-context.js";
 // initialized `config` export as undefined partway through that cycle,
 // which crashed every request (and every test that imports anything
 // touching this module) before config had finished evaluating.
+// which crashed every request (and every test, since buildApp() creates a
+// logger on every call) before config had finished evaluating.
 const nodeEnv = process.env.NODE_ENV ?? "development";
 
 export const logger = pino({
