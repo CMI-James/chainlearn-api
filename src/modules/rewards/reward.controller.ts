@@ -1,5 +1,3 @@
-import { GrantCreditsDto } from './dto/grant-credits.dto';
-import { AdminAuthGuard } from '../../common/guards/admin-auth.guard';
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { rewardService } from "./reward.service.js";
 import type { AuthenticatedRequest } from "../../middleware/auth.js";
@@ -132,17 +130,6 @@ export class RewardController {
       data: transactions,
       pagination: { page, limit, total },
     });
-  }
-
-
-  @Post(':id/credits/grant')
-  async grantCredits(
-    @Param('id') userId: string,
-    @Body() dto: GrantCreditsDto,
-    @Req() req: any,
-  ) {
-    const adminId = req.user?.id; // Assumes admin user is attached to request by guard
-    return this.rewardService.grantCreditsToUser(userId, dto, adminId);
   }
   /**
    * GET /api/rewards/leaderboard

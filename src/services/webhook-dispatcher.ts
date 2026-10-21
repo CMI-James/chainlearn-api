@@ -104,7 +104,7 @@ async function sendWebhook(
     logger.error({ url, err }, "Webhook dispatch failed");
     return { success: false, error: err.message };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeout);
   }
 }
 

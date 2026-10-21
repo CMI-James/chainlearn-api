@@ -10,7 +10,6 @@ import {
   adminUpdateQuizSchema,
   authoredQuestionSchema,
   authoredQuizSchema,
-  archiveModuleQuizSchema,
 } from "../quizzes/quiz.types.js";
 import {
   createCourseSchema,
@@ -570,12 +569,12 @@ export async function adminCourseRoutes(app: FastifyInstance): Promise<void> {
         },
         body: {
           type: "object",
-          required: ["title"],
+          required: ["title", "type", "content"],
           properties: {
             title: { type: "string", minLength: 1 },
-            content: { type: "string" },
-            contentType: { type: "string" },
-            videoUrl: { type: "string" },
+            type: { type: "string", enum: ["text", "video", "quiz", "exercise"] },
+            content: { type: "object" },
+            orderIndex: { type: "integer", minimum: 0 },
           },
         },
       } as FastifySchema,
@@ -692,29 +691,6 @@ export async function adminCourseRoutes(app: FastifyInstance): Promise<void> {
     (request, reply) => quizController.archiveModuleQuiz(request, reply),
   );
 
-  app.get<{ Params: { id: string; moduleId: string; quizId: string } }>(
-    "/:id/modules/:moduleId/quizzes/:quizId/analytics",
-    {
-      preHandler: [validate({ params: adminQuizParamsSchema })],
-      schema: {
-        description:
-          "Question-by-question analytics for a quiz: correct rate, the most commonly picked wrong answers, and a score distribution across its attempts (admin only, cached 5 minutes, #417)",
-        tags: ["admin", "courses", "quizzes"],
-        security: [{ bearerAuth: [] }],
-        params: {
-          type: "object",
-          required: ["id", "moduleId", "quizId"],
-          properties: {
-            id: { type: "string", format: "uuid" },
-            moduleId: { type: "string", minLength: 1, maxLength: 100 },
-            quizId: { type: "string", format: "uuid" },
-          },
-        },
-      } as FastifySchema,
-    },
-    (request, reply) => quizController.getQuizAnalytics(request, reply),
-  );
-
   app.post<{
     Params: { id: string; moduleId: string; quizId: string };
     Body: import("../quizzes/quiz.types.js").AuthoredQuestion;
@@ -810,66 +786,6 @@ export async function adminCourseRoutes(app: FastifyInstance): Promise<void> {
       } as FastifySchema,
     },
     (request, reply) => quizController.deleteModuleQuiz(request, reply),
-  );
-
-  app.post<{
-    Params: { id: string; moduleId: string; quizId: string };
-    Body: import("../quizzes/quiz.types.js").ArchiveModuleQuizBody;
-  }>(
-    "/:id/modules/:moduleId/quizzes/:quizId/archive",
-    {
-      preHandler: [
-        validate({
-          params: adminQuizParamsSchema,
-          body: archiveModuleQuizSchema,
-        }),
-      ],
-      schema: {
-        description:
-          "Archive a quiz: hides it from user-facing quiz lists while preserving the quiz and its submissions. Send { \"archived\": false } to unarchive. A thin wrapper over the same atomic, audit-logged write POST .../quizzes/:quizId performs with an `archived` field — this gives the action its own discoverable URL (admin only, #416)",
-        tags: ["admin", "courses", "quizzes"],
-        security: [{ bearerAuth: [] }],
-        params: {
-          type: "object",
-          required: ["id", "moduleId", "quizId"],
-          properties: {
-            id: { type: "string", format: "uuid" },
-            moduleId: { type: "string", minLength: 1, maxLength: 100 },
-            quizId: { type: "string", format: "uuid" },
-          },
-        },
-        body: {
-          type: "object",
-          properties: {
-            archived: { type: "boolean", default: true },
-          },
-        },
-      } as FastifySchema,
-    },
-    (request, reply) => quizController.archiveModuleQuiz(request, reply),
-  );
-
-  app.get<{ Params: { id: string; moduleId: string; quizId: string } }>(
-    "/:id/modules/:moduleId/quizzes/:quizId/analytics",
-    {
-      preHandler: [validate({ params: adminQuizParamsSchema })],
-      schema: {
-        description:
-          "Detailed analytics for one quiz: question-by-question correct rate and most common wrong answer, score distribution, and attempt patterns (current vs superseded retries). Per-question timing is not tracked at the data layer today and is always reported as unavailable rather than fabricated (admin only, cached 5 minutes, #417)",
-        tags: ["admin", "courses", "quizzes"],
-        security: [{ bearerAuth: [] }],
-        params: {
-          type: "object",
-          required: ["id", "moduleId", "quizId"],
-          properties: {
-            id: { type: "string", format: "uuid" },
-            moduleId: { type: "string", minLength: 1, maxLength: 100 },
-            quizId: { type: "string", format: "uuid" },
-          },
-        },
-      } as FastifySchema,
-    },
-    (request, reply) => quizController.getQuizAnalytics(request, reply),
   );
 
   app.delete<{ Params: { id: string; moduleId: string; contentId: string } }>(
