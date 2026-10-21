@@ -16,15 +16,18 @@ export function safeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
   if (bufA.length !== bufB.length) {
-    // Pad the shorter buffer to match the longer one so timingSafeEqual
-    // doesn't throw. The length mismatch itself is not secret — an
-    // attacker learns nothing from it that they couldn't already see by
-    // comparing the strings directly.
+    // Buffers of different lengths are never equal. We still run a
+    // constant-time comparison (on zero-padded copies) so the function's
+    // timing doesn't leak the fact that lengths differ, but the result is
+    // always `false` here — without this explicit check, zero-padding
+    // would make strings that only differ by trailing NUL bytes (e.g.
+    // "abc" vs "abc\0") compare as equal, which is not the intent.
     const padded = Buffer.alloc(Math.max(bufA.length, bufB.length));
     bufA.copy(padded);
     const paddedB = Buffer.alloc(padded.length);
     bufB.copy(paddedB);
-    return crypto.timingSafeEqual(padded, paddedB);
+    crypto.timingSafeEqual(padded, paddedB);
+    return false;
   }
   return crypto.timingSafeEqual(bufA, bufB);
 }
