@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { buildApp } from "../../src/server.js";
 import { db } from "../../src/config/database.js";
 import { users, auditLogs } from "../../src/database/schema.js";
+import { encodeCursor } from "../../src/utils/cursor-pagination.js";
 
 describe("Admin Audit Logs API (#289)", () => {
   let app: FastifyInstance;
@@ -164,6 +165,136 @@ describe("Admin Audit Logs API (#289)", () => {
       });
 
       expect(response.statusCode).toBe(400);
+    });
+  });
+
+  describe("cursor pagination (#482)", () => {
+    const cursorEvent = "auth.login_failed.cursor-test" as const;
+    const seededTimestamps: Date[] = [];
+
+    beforeAll(async () => {
+      const base = Date.now();
+      const rows = await db
+        .insert(auditLogs)
+        .values(
+          Array.from({ length: 5 }, (_, i) => ({
+            event: cursorEvent,
+            fields: { note: `cursor-test-${i}` },
+            createdAt: new Date(base - i * 1000),
+          })),
+        )
+        .returning();
+      insertedIds.push(...rows.map((r) => r.id));
+      seededTimestamps.push(...rows.map((r) => r.createdAt));
+    });
+
+    it("should return nextCursor when more rows exist than the page limit", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=2`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.payload);
+      expect(body.data.length).toBe(2);
+      expect(body.pagination.nextCursor).toBeTypeOf("string");
+    });
+
+    it("should return null nextCursor on the last page", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=100`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.payload);
+      expect(body.pagination.nextCursor).toBeNull();
+    });
+
+    it("should page through all rows via nextCursor with no overlap or gaps", async () => {
+      const seen: string[] = [];
+      let cursor: string | undefined;
+
+      for (let i = 0; i < 10; i++) {
+        const url = cursor
+          ? `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=2&cursor=${encodeURIComponent(cursor)}`
+          : `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=2`;
+
+        const response = await app.inject({
+          method: "GET",
+          url,
+          headers: { authorization: `Bearer ${adminToken()}` },
+        });
+
+        const body = JSON.parse(response.payload);
+        seen.push(...body.data.map((row: { id: string }) => row.id));
+
+        if (!body.pagination.nextCursor) break;
+        cursor = body.pagination.nextCursor;
+      }
+
+      expect(seen.length).toBe(5);
+      expect(new Set(seen).size).toBe(5);
+    });
+
+    it("cursor should take precedence over offset when both are given", async () => {
+      const firstPage = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=2`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+      const firstBody = JSON.parse(firstPage.payload);
+      const cursor = firstBody.pagination.nextCursor as string;
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=2&offset=0&cursor=${encodeURIComponent(cursor)}`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+
+      const body = JSON.parse(response.payload);
+      const firstIds = new Set(firstBody.data.map((r: { id: string }) => r.id));
+      for (const row of body.data) {
+        expect(firstIds.has(row.id)).toBe(false);
+      }
+    });
+
+    it("should treat an unparseable cursor as absent and start from the first page", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=2&cursor=not-a-valid-cursor`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.payload);
+      expect(body.data.length).toBe(2);
+    });
+
+    it("a manually-encoded cursor should resume immediately after the given row", async () => {
+      const boundaryRow = {
+        createdAt: seededTimestamps[2]!,
+        id: insertedIds[insertedIds.length - 3]!,
+      };
+      const cursor = encodeCursor(boundaryRow);
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/audit-logs?event=${cursorEvent}&limit=10&cursor=${encodeURIComponent(cursor)}`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+
+      const body = JSON.parse(response.payload);
+      expect(
+        body.data.some((row: { id: string }) => row.id === boundaryRow.id),
+      ).toBe(false);
+      for (const row of body.data) {
+        expect(new Date(row.createdAt).getTime()).toBeLessThan(
+          boundaryRow.createdAt.getTime(),
+        );
+      }
     });
   });
 });

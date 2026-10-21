@@ -1,51 +1,31 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockUpdate, mockSelect } = vi.hoisted(() => ({
-  mockUpdate: vi.fn(),
-  mockSelect: vi.fn(),
-}));
-
-vi.mock("../../../src/config/database.js", () => ({
-  db: {
-    update: mockUpdate,
-    select: mockSelect,
-  },
-}));
-
-vi.mock("../../../src/utils/logger.js", () => ({
-  logger: {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-vi.mock("../../../src/config/redis.js", () => ({
-  redis: {
-    get: vi.fn(),
-    set: vi.fn(),
-    del: vi.fn(),
-  },
-}));
-
-describe("reconcile-pending-rewards", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("should have proper mock structure", () => {
-    expect(mockUpdate).toBeDefined();
-    expect(mockSelect).toBeDefined();
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
-const mockUpdate = vi.fn();
-const mockSet = vi.fn();
-const mockWhere = vi.fn();
-const mockSelect = vi.fn();
-const mockFrom = vi.fn();
-const mockWhereSelect = vi.fn();
-const mockLimit = vi.fn();
-const mockTransaction = vi.fn();
+// Hoisted so vi.mock(...) factories below (which are themselves hoisted
+// to the top of the module at compile time) can reference these without
+// hitting a temporal dead zone.
+const {
+  mockUpdate,
+  mockSet,
+  mockWhere,
+  mockSelect,
+  mockFrom,
+  mockWhereSelect,
+  mockLimit,
+  mockTransaction,
+  mockGetTransaction,
+} = vi.hoisted(() => ({
+  mockUpdate: vi.fn(),
+  mockSet: vi.fn(),
+  mockWhere: vi.fn(),
+  mockSelect: vi.fn(),
+  mockFrom: vi.fn(),
+  mockWhereSelect: vi.fn(),
+  mockLimit: vi.fn(),
+  mockTransaction: vi.fn(),
+  mockGetTransaction: vi.fn(),
+}));
 
 vi.mock("../../../src/config/database.js", () => ({
   db: {
@@ -73,7 +53,6 @@ vi.mock("drizzle-orm", async () => {
   };
 });
 
-const mockGetTransaction = vi.fn();
 vi.mock("../../../src/stellar/client.js", () => ({
   stellarClient: {
     getTransaction: mockGetTransaction,

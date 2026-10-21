@@ -788,6 +788,29 @@ export async function adminCourseRoutes(app: FastifyInstance): Promise<void> {
     (request, reply) => quizController.deleteModuleQuiz(request, reply),
   );
 
+  app.get<{ Params: { id: string; moduleId: string; quizId: string } }>(
+    "/:id/modules/:moduleId/quizzes/:quizId/analytics",
+    {
+      preHandler: [validate({ params: adminQuizParamsSchema })],
+      schema: {
+        description:
+          "Detailed analytics for one quiz: question-by-question correct rate and most common wrong answer, score distribution, and attempt patterns (current vs superseded retries). Per-question timing is not tracked at the data layer today and is always reported as unavailable rather than fabricated (admin only, cached 5 minutes, #417)",
+        tags: ["admin", "courses", "quizzes"],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: "object",
+          required: ["id", "moduleId", "quizId"],
+          properties: {
+            id: { type: "string", format: "uuid" },
+            moduleId: { type: "string", minLength: 1, maxLength: 100 },
+            quizId: { type: "string", format: "uuid" },
+          },
+        },
+      } as FastifySchema,
+    },
+    (request, reply) => quizController.getQuizAnalytics(request, reply),
+  );
+
   app.delete<{ Params: { id: string; moduleId: string; contentId: string } }>(
     "/:id/modules/:moduleId/content/:contentId",
     {

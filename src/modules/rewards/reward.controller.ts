@@ -131,6 +131,7 @@ export class RewardController {
       pagination: { page, limit, total },
     });
   }
+
   /**
    * GET /api/rewards/leaderboard
    * Get the top earners by total credits. No authentication required.
