@@ -4,13 +4,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockDeleteChain = {
   where: vi.fn(),
+  returning: vi.fn(),
 };
 
 const mockDb = { delete: vi.fn(() => mockDeleteChain) };
 
 vi.mock("../../../src/config/database.js", () => ({ db: mockDb }));
 vi.mock("../../../src/database/schema.js", () => ({
-  notifications: { createdAt: "createdAt" },
+  notifications: { createdAt: "createdAt", id: "id" },
 }));
 vi.mock("../../../src/utils/logger.js", () => ({
   logger: { info: vi.fn(), error: vi.fn() },
@@ -24,20 +25,22 @@ const { cleanupExpiredNotifications, startNotificationCleanup, stopNotificationC
 describe("cleanupExpiredNotifications()", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockDeleteChain.where.mockReturnValue(mockDeleteChain);
   });
 
   it("deletes notifications older than 30 days and returns the count", async () => {
-    mockDeleteChain.where.mockResolvedValue([{ id: "a" }, { id: "b" }]);
+    mockDeleteChain.returning.mockResolvedValue([{ id: "a" }, { id: "b" }]);
 
     const deleted = await cleanupExpiredNotifications();
 
     expect(deleted).toBe(2);
     expect(mockDb.delete).toHaveBeenCalledOnce();
     expect(mockDeleteChain.where).toHaveBeenCalledOnce();
+    expect(mockDeleteChain.returning).toHaveBeenCalledOnce();
   });
 
   it("returns 0 when no notifications are older than 30 days", async () => {
-    mockDeleteChain.where.mockResolvedValue([]);
+    mockDeleteChain.returning.mockResolvedValue([]);
 
     const deleted = await cleanupExpiredNotifications();
 
@@ -45,7 +48,7 @@ describe("cleanupExpiredNotifications()", () => {
   });
 
   it("passes a cutoff date that is approximately 30 days ago", async () => {
-    mockDeleteChain.where.mockResolvedValue([]);
+    mockDeleteChain.returning.mockResolvedValue([]);
     const before = Date.now();
 
     await cleanupExpiredNotifications();
@@ -66,7 +69,7 @@ describe("cleanupExpiredNotifications()", () => {
   });
 
   it("propagates database errors", async () => {
-    mockDeleteChain.where.mockRejectedValue(new Error("DB error"));
+    mockDeleteChain.returning.mockRejectedValue(new Error("DB error"));
 
     await expect(cleanupExpiredNotifications()).rejects.toThrow("DB error");
   });
@@ -75,7 +78,8 @@ describe("cleanupExpiredNotifications()", () => {
 describe("startNotificationCleanup / stopNotificationCleanup", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    mockDeleteChain.where.mockResolvedValue([]);
+    mockDeleteChain.where.mockReturnValue(mockDeleteChain);
+    mockDeleteChain.returning.mockResolvedValue([]);
   });
 
   afterEach(() => {
