@@ -41,6 +41,19 @@ describe("auth-attempt-tracker (#488)", () => {
       expect(result.lockedOut).toBe(true);
       expect(result.retryAfterSeconds).toBe(45);
     });
+
+    it("reports not locked out once the lockout key has expired (ttl 0)", async () => {
+      mockRedis.ttl.mockResolvedValue(0);
+      const result = await checkAuthLockout("GADDRESS");
+      expect(result.lockedOut).toBe(false);
+      expect(result.retryAfterSeconds).toBeUndefined();
+    });
+
+    it("treats a missing-key ttl (-2) the same as an expired lockout", async () => {
+      mockRedis.ttl.mockResolvedValue(-2);
+      const result = await checkAuthLockout("GADDRESS");
+      expect(result.lockedOut).toBe(false);
+    });
   });
 
   describe("recordAuthFailure", () => {
@@ -96,6 +109,16 @@ describe("auth-attempt-tracker (#488)", () => {
         expect.stringContaining("count"),
         expect.stringContaining("lockout"),
       );
+    });
+
+    it("allows a subsequent lockout check to report not-locked-out after clearing", async () => {
+      await clearAuthFailures("GADDRESS");
+
+      // Simulate redis reflecting the deletion: no lockout key left.
+      mockRedis.ttl.mockResolvedValue(-2);
+      const result = await checkAuthLockout("GADDRESS");
+
+      expect(result.lockedOut).toBe(false);
     });
   });
 });
