@@ -5,6 +5,7 @@ import { getRequestId } from "./request-context.js";
 // that module imports this one (to log its own validation warnings/errors),
 // so importing config here would form a cycle — ESM leaves the not-yet-
 // initialized `config` export as undefined partway through that cycle,
+// which crashed every request (and every test, since buildApp() builds a
 // which crashed every request (and every test that imports anything
 // touching this module) before config had finished evaluating.
 // which crashed every request (and every test, since buildApp() creates a

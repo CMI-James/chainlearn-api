@@ -569,12 +569,12 @@ export async function adminCourseRoutes(app: FastifyInstance): Promise<void> {
         },
         body: {
           type: "object",
-          required: ["title"],
+          required: ["title", "type", "content"],
           properties: {
             title: { type: "string", minLength: 1 },
-            content: { type: "string" },
-            contentType: { type: "string" },
-            videoUrl: { type: "string" },
+            type: { type: "string", enum: ["text", "video", "quiz", "exercise"] },
+            content: { type: "object" },
+            orderIndex: { type: "integer", minimum: 0 },
           },
         },
       } as FastifySchema,
