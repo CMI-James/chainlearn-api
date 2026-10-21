@@ -1,16 +1,5 @@
-// src/modules/credentials/credential.controller.ts
-
-import { Controller, Get, Param, UseGuards, Header } from '@nestjs/common';
-import { CredentialService } from './credential.service';
-import { AdminAuthGuard } from '../../common/guards/admin-auth.guard';
-
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { credentialService } from "./credential.service.js";
-import { Controller, Get, Param, Req, Res, UseGuards } from '@nestjs/common';
-import { Response } from 'express';
-import { CredentialService } from './credential.service';
-// import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
-
 import type { AuthenticatedRequest } from "../../middleware/auth.js";
 import type {
   BatchMintCredentialBody,
@@ -21,18 +10,6 @@ import {
   storeIdempotentResponse,
 } from "../../middleware/idempotency.js";
 
-
-@Controller('api/v1/admin/users')
-@UseGuards(AdminAuthGuard)
-export class AdminCredentialController {
-  constructor(private readonly credentialService: CredentialService) {}
-
-  @Get(':id/credentials')
-  @Header('Cache-Control', 'public, max-age=30')
-  async getUserCredentials(@Param('id') userId: string) {
-    return this.credentialService.getCredentialsByUserId(userId);
-  }
-}
 export class CredentialController {
   /**
    * POST /api/credentials/mint
@@ -166,29 +143,3 @@ export class CredentialController {
 }
 
 export const credentialController = new CredentialController();
-
-
-
-@Controller('api/v1/courses')
-export class CredentialController {
-  constructor(private readonly credentialService: CredentialService) {}
-
-  @Get(':id/completion-certificate')
-  // @UseGuards(JwtAuthGuard)
-  async getCompletionCertificate(
-    @Param('id') courseId: string,
-    @Req() req: any,
-    @Res() res: Response,
-  ): Promise<void> {
-    const userId = req.user?.id || 'mock-user-id';
-
-    const pdfBuffer = await this.credentialService.generateCompletionCertificate(userId, courseId);
-
-    // Set caching headers for generated certificate (cache for 1 hour since completion is static)
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="certificate-${courseId}.pdf"`);
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-
-    res.status(200).send(pdfBuffer);
-  }
-}

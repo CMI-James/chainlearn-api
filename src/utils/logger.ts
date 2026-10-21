@@ -1,16 +1,18 @@
 import pino from "pino";
-import { config } from "../config/index.js";
 import { getRequestId } from "./request-context.js";
 
+// Reads process.env.NODE_ENV directly rather than importing config/index.ts:
+// that module imports this one (to log its own validation warnings/errors),
+// so importing config here would form a cycle — ESM leaves the not-yet-
+// initialized `config` export as undefined partway through that cycle,
+// which crashed every request (and every test, since buildApp() creates a
+// logger on every call) before config had finished evaluating.
+const nodeEnv = process.env.NODE_ENV ?? "development";
+
 export const logger = pino({
-  level:
-    config.NODE_ENV === "production"
-      ? "info"
-      : config.NODE_ENV === "test"
-        ? "silent"
-        : "debug",
+  level: nodeEnv === "production" ? "info" : nodeEnv === "test" ? "silent" : "debug",
   transport:
-    config.NODE_ENV !== "production"
+    nodeEnv !== "production"
       ? { target: "pino-pretty", options: { colorize: true } }
       : undefined,
   serializers: {

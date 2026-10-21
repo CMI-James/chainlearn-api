@@ -82,7 +82,7 @@ async function buildApp() {
 
   const app = Fastify({
     bodyLimit: config.REQUEST_BODY_LIMIT_BYTES,
-    logger,
+    loggerInstance: logger,
     // requestIdHeader tells Fastify to reuse a client-supplied X-Request-Id
     // as request.id instead of always minting a fresh one via genReqId —
     // genReqId only runs when the header is absent or blank (#287).
